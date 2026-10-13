@@ -1,0 +1,14 @@
+digraph G {
+  rankdir=LR; fontname="Helvetica"; node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, fillcolor="#E8F1FB", color="#2F6DB5"]; edge [fontname="Helvetica", fontsize=9];
+  sim [label="Vehicle sensors\n(simulator.py)\ntyre pressure x4\naccelerator + clutch\nfuel level + efficiency", fillcolor="#FFF4D6", color="#C58B00"];
+  iot [label="AWS IoT Core\ntopic vehicles/<id>/telemetry"];
+  r1 [label="Rule 1\nto S3 pipeline", shape=ellipse]; r2 [label="Rule 2\nlow tyre < 28 psi", shape=ellipse]; r3 [label="Rule 3\nlatest state", shape=ellipse];
+  fh [label="Kinesis Data Firehose\n(60 s buffer)"]; s3 [label="Amazon S3\nJSON, dt=/hr= partitions"]; glue [label="Glue Data Catalog\ntable telemetry"]; ath [label="Amazon Athena\nSQL (history)"];
+  sns [label="Amazon SNS\nemail alert", fillcolor="#FDE7E7", color="#BB3333"]; ddb [label="DynamoDB\nvehicle-latest-state\n(real-time view)", fillcolor="#E6F6E6", color="#2E8B2E"];
+  bot [label="chatbot.py\nfixed safe queries\n+ keyword fallback", fillcolor="#F0E6FA", color="#7A3FB5"]; llm [label="LLM API (outside AWS)\nGoogle Gemini free tier\n(Bedrock blocked on this account)", fillcolor="#F5F5F5", color="#777777", style="rounded,filled,dashed"]; user [label="Driver /\nsupport team", shape=oval, fillcolor="#FFFFFF"];
+  sim -> iot [label="MQTT"]; iot -> r1; iot -> r2; iot -> r3;
+  r1 -> fh; fh -> s3; s3 -> glue [style=dashed, label="schema"]; glue -> ath; s3 -> ath [label="reads"];
+  r2 -> sns; sns -> user [label="email"]; r3 -> ddb; ddb -> user [label="latest status"];
+  ath -> bot [label="query"]; bot -> user [label="answers"];
+  bot -> llm [label="question +\nsmall result table", style=dashed];
+}

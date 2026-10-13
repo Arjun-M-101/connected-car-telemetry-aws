@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Connected-car telemetry - IoT Core -> Firehose -> S3 -> Glue table -> Athena (+ low tyre alert)
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email that receives low tyre pressure alerts
+  LowTyrePsi:
+    Type: Number
+    Default: 28
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: firehose.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-to-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "telemetry/dt=!{timestamp:yyyy-MM-dd}/hr=!{timestamp:HH}/"
+        ErrorOutputPrefix: "errors/!{firehose:error-output-type}/dt=!{timestamp:yyyy-MM-dd}/"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        CompressionFormat: UNCOMPRESSED
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  IotRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: iot.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: iot-rule-actions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: firehose:PutRecord
+                Resource: !GetAtt DeliveryStream.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt LatestStateTable.Arn
+
+  TelemetryRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: vehicle_telemetry_to_s3
+      TopicRulePayload:
+        Sql: "SELECT *, timestamp() AS ingest_ts FROM 'vehicles/+/telemetry'"
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: false
+        Actions:
+          - Firehose:
+              DeliveryStreamName: !Ref DeliveryStream
+              RoleArn: !GetAtt IotRuleRole.Arn
+              Separator: "\n"
+
+  LowTyreRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: vehicle_low_tyre_alert
+      TopicRulePayload:
+        Sql: !Sub >-
+          SELECT vehicle_id, event_time, tyre_fl_psi, tyre_fr_psi, tyre_rl_psi, tyre_rr_psi
+          FROM 'vehicles/+/telemetry'
+          WHERE tyre_fl_psi < ${LowTyrePsi} OR tyre_fr_psi < ${LowTyrePsi}
+          OR tyre_rl_psi < ${LowTyrePsi} OR tyre_rr_psi < ${LowTyrePsi}
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: false
+        Actions:
+          - Sns:
+              TargetArn: !Ref AlertTopic
+              RoleArn: !GetAtt IotRuleRole.Arn
+              MessageFormat: RAW
+
+  LatestStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: vehicle-latest-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: vehicle_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: vehicle_id, KeyType: HASH }
+
+  LatestStateRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: vehicle_latest_state_to_dynamodb
+      TopicRulePayload:
+        Sql: "SELECT *, timestamp() AS ingest_ts FROM 'vehicles/+/telemetry'"
+        AwsIotSqlVersion: "2016-03-23"
+        RuleDisabled: false
+        Actions:
+          - DynamoDBv2:
+              PutItem:
+                TableName: !Ref LatestStateTable
+              RoleArn: !GetAtt IotRuleRole.Arn
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: vehicle_telemetry
+
+  TelemetryTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: telemetry
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: "2026-10-01,NOW"
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          projection.hr.type: integer
+          projection.hr.range: "0,23"
+          projection.hr.digits: "2"
+          storage.location.template: !Sub "s3://${DataBucket}/telemetry/dt=${!dt}/hr=${!hr}/"
+        PartitionKeys:
+          - { Name: dt, Type: string }
+          - { Name: hr, Type: string }
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/telemetry/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+          Columns:
+            - { Name: vehicle_id, Type: string }
+            - { Name: event_time, Type: string }
+            - { Name: tyre_fl_psi, Type: double }
+            - { Name: tyre_fr_psi, Type: double }
+            - { Name: tyre_rl_psi, Type: double }
+            - { Name: tyre_rr_psi, Type: double }
+            - { Name: accelerator_pct, Type: double }
+            - { Name: clutch_pct, Type: double }
+            - { Name: speed_kmph, Type: double }
+            - { Name: fuel_level_pct, Type: double }
+            - { Name: fuel_efficiency_kmpl, Type: double }
+            - { Name: ingest_ts, Type: bigint }
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: vehicle-telemetry
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+
+Outputs:
+  Bucket:
+    Value: !Ref DataBucket
+  TopicPattern:
+    Value: vehicles/<vehicle_id>/telemetry
+  AthenaWorkgroup:
+    Value: !Ref AthenaWorkgroup
+  LatestStateTable:
+    Value: !Ref LatestStateTable
