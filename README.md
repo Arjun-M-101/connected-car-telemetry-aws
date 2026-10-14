@@ -4,9 +4,15 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 
 > **Status:** proof of concept with production-minded foundations. The sensors are **simulated** (`simulator.py`), and a real-device-style publisher (`device_mqtt.py`) uses X.509 certificates over MQTT. Everything on the AWS side is real and is created from one CloudFormation template. All data is synthetic.
 
-![architecture](docs/architecture.png)
+### Architecture (dark)
 
-*Architecture diagram, generated from `docs/architecture.dot` with Graphviz (the script was written with AI assistance).*
+![Architecture diagram, dark mode](screenshots/AWS_Architecture_Diagram-Dark.png)
+
+### Architecture (light)
+
+![Architecture diagram, light mode](screenshots/AWS_Architecture_Diagram-Default.png)
+
+*The architecture diagrams were generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if the two ever differ.*
 
 ## Contents
 1. [What it covers](#1-what-it-covers)
@@ -20,6 +26,7 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 9. [Playbook: deploy, test, verify, tear down](#9-playbook-deploy-test-verify-tear-down)
 10. [Troubleshooting](#10-troubleshooting)
 11. [Limitations and roadmap](#11-limitations-and-roadmap)
+12. [Screenshots](#12-screenshots)
 
 ---
 
@@ -65,8 +72,8 @@ The history path (S3/Athena) is **near-real-time** (about 1 to 2 minutes, becaus
 │   ├── provision_device.sh       create an IoT thing + certificate and attach the device policy
 │   └── deprovision_device.sh     remove a device completely (run before deleting the stack)
 ├── tests/                        79 unit tests (no AWS account needed)
+├── screenshots/                  architecture diagrams (dark and light) and redacted evidence from real runs (section 12)
 ├── docs/
-│   ├── architecture.dot / .png   architecture diagram
 │   └── PRODUCTION_READINESS.md   gap analysis and roadmap from proof of concept to production
 ├── requirements.txt
 └── .github/workflows/ci.yml      runs the tests and cfn-lint on every push
@@ -409,3 +416,218 @@ Then delete the LLM API key in the provider console, run `rm -rf certs __pycache
 * No user interface beyond the Athena console and the command-line chatbot.
 
 `docs/PRODUCTION_READINESS.md` lists, area by area, what is built and what a production roll-out needs, the challenges of real hardware, and a phased plan.
+
+## 12. Screenshots
+
+Evidence from real runs in my own AWS account (region ap-south-1). All data is synthetic. Account ID, e-mail address, ARNs that contain the account ID, the IoT endpoint and source IP addresses are covered with black boxes. File names containing `v3` come from the first version and are kept as history; `v4` marks the v4 run and `v4.1` the v4.1 re-test that verified the fix. The step-by-step commands that produce each screenshot are in the [playbook](#9-playbook-deploy-test-verify-tear-down).
+
+```
+screenshots/
+├── AWS_Architecture_Diagram-Dark.png      architecture diagram, dark mode (AI-generated, author-checked)
+├── AWS_Architecture_Diagram-Default.png   architecture diagram, light mode
+├── iam-roles-list.png                                         # IAM console: the three stack service roles (Firehose, IoT rule, Lambda)
+├── s3-data-bucket-console.png                                 # S3 console: the single data bucket in ap-south-1
+├── s3-telemetry-first-object-listing-v3.png                   # first telemetry object after the 5-batch smoke test (v3 run)
+├── s3-telemetry-and-raw-listing.png                           # telemetry/ (clean) next to raw/ (untouched) plus the original "flat" and -5 values in raw/
+├── s3-security-block-encryption-tls-policy.png                # public access block, AES256 encryption, DenyNonTLS bucket policy
+├── iot-rules-list-two-rules-v3.png                            # IoT rules list after the first deployment, two rules (v3 run)
+├── iot-rule-telemetry-to-firehose-v3.png                      # rule vehicle_telemetry_to_s3, Firehose action (v3 SQL)
+├── iot-rule-low-tyre-alert-sns.png                            # rule vehicle_low_tyre_alert, SNS action (v3 SQL)
+├── mqtt-test-client-subscribe.png                             # MQTT test client subscribed to vehicles/+/telemetry
+├── mqtt-test-client-live-messages.png                         # live telemetry messages arriving in the MQTT test client
+├── iot-rules-list-three-rules.png                             # IoT rules list, three active rules
+├── iot-rule-latest-state-dynamodb-v3.png                      # rule vehicle_latest_state_to_dynamodb (v3 SQL)
+├── iot-rule-latest-state-topic-vehicle-id-v4.1.png            # rule 3 SQL after v4.1: topic(2) AS vehicle_id
+├── firehose-delivery-stream-active.png                        # Firehose delivery stream, Direct PUT to S3
+├── firehose-stream-details-v3.png                             # Firehose stream details (v3 run, before error logging was enabled)
+├── glue-database.png                                          # Glue database vehicle_telemetry
+├── glue-table-overview.png                                    # Glue table telemetry, JSON, location in the data bucket
+├── glue-table-schema-v3.png                                   # Glue table schema, 14 columns (v3 run)
+├── athena-latest-20-rows.png                                  # Athena: latest 20 readings
+├── athena-row-count-per-car-v3.png                            # Athena: 65 rows per car (v3 run)
+├── athena-lowest-tyre-pressure-v3.png                         # Athena: lowest tyre pressure per car before the leak run
+├── athena-fuel-efficiency.png                                 # Athena: average fuel efficiency and lowest fuel level per car
+├── athena-clutch-usage.png                                    # Athena: share of readings with the clutch pressed
+├── athena-harsh-acceleration-zero-rows.png                    # Athena: accelerator above 85 percent, 0 rows on the small data set
+├── athena-leak-trace-car001.png                               # Athena: front-left tyre of CAR-001 falling during the leak run
+├── athena-car001-latest-30-readings-v4.png                    # Athena: CAR-001 latest 30 readings through the validation Lambda
+├── athena-row-count-and-schema-version-v4.png                 # Athena: 217 readings per car, schema_version 1
+├── sns-low-tyre-alert-emails-v3.png                           # low-tyre alert e-mails from the leak run (v3 run)
+├── sns-low-tyre-alert-emails-v4.png                           # low-tyre alert e-mails, front-left falling from 27.8 to 26.5 psi
+├── sns-operations-subscription-confirmed.png                  # operations SNS topic subscription confirmed
+├── ops-alarm-email-transform-errors-test.png                  # operations alarm e-mail (alarm state set by hand to test the path)
+├── ops-alarm-email-no-data-alarm.png                          # operations e-mail: real no-data alarm in ALARM
+├── ops-alarm-email-no-data-ok.png                             # operations e-mail: no-data alarm back to OK
+├── dynamodb-latest-state-table-details.png                    # DynamoDB table vehicle-latest-state, key vehicle_id
+├── dynamodb-items-first-scan.png                              # DynamoDB items, first scan, one per car
+├── dynamodb-items-second-scan.png                             # DynamoDB items, second scan 16 seconds later (values changed)
+├── dynamodb-cli-scans-v3.png                                  # DynamoDB CLI scans (v3 run)
+├── dynamodb-cli-scans-v4.png                                  # DynamoDB CLI scans while the simulator ran (v4 run)
+├── chatbot-keyword-mode.png                                   # chatbot keyword mode, tables straight from Athena
+├── chatbot-gemini-model-list.png                              # silent key entry and the Gemini model list
+├── chatbot-llm-mode-answers.png                               # chatbot LLM mode: intent plus a sentence
+├── chatbot-llm-harsh-acceleration.png                         # chatbot LLM answer: harsh acceleration
+├── chatbot-llm-clutch-usage.png                               # chatbot LLM answer: clutch usage
+├── chatbot-interactive-latest-status.png                      # chatbot interactive mode: latest record for CAR-001
+├── chatbot-keyword-clutch-usage.png                           # chatbot keyword mode: clutch usage
+├── chatbot-v4-keyword-lowest-tyre.png                         # chatbot keyword mode: lowest tyre pressure per car
+├── chatbot-v4-keyword-fuel-efficiency.png                     # chatbot keyword mode: fuel efficiency and fuel left per car
+├── chatbot-v4-keyword-vehicle-summary.png                     # chatbot keyword mode: summary for CAR-001
+├── chatbot-v4-data-quality-question.png                       # chatbot data_quality question: flagged readings
+├── chatbot-v4-llm-lowest-tyre.png                             # chatbot LLM mode: sentence matches the table
+├── cloudformation-deploy-v3.png                               # unzip, cloudformation deploy and reading the bucket name (v3 run)
+├── simulator-smoke-test.png                                   # simulator smoke test, 5 batches of 3 messages
+├── simulator-leak-run.png                                     # simulator leak scenario (--leak)
+├── pytest-70-passed-and-stack-update-v4.png                   # 70 tests passed, then the v4 stack update (superseded by 79 tests)
+├── cloudformation-deploy-no-data-alarm-on.png                 # stack update with EnableNoDataAlarm=true
+├── pytest-79-passed-cfn-lint-clean.png                        # 79 tests passed and cfn-lint with no findings
+├── cloudformation-deploy-v4.1.png                             # v4.1 deployed as an update of the same stack
+├── cloudformation-stack-resources.png                         # stack resources (29 with the optional alarm off)
+├── github-actions-ci-green.png                                # GitHub Actions: ci passes on the v4.1 commits
+├── send-test-events-output.png                                # send_test_events.py: the seven CAR-900 test events
+├── lambda-log-and-iot-rule-error-log-before-fix.png           # Lambda log and the IoT rule error log before the v4.1 fix
+├── athena-claimed-id-car777-count-zero.png                    # Athena: the payload claiming CAR-777 was not stored under that ID
+├── athena-extras-new-field-battery-v.png                      # Athena: new field battery_v kept in extras and readable at once
+├── athena-car900-drift-result.png                             # Athena: the seven CAR-900 events, run twice (14 rows) with dq_issues and extras
+├── dynamodb-scan-no-car777-rule-errors-empty.png              # v4.1 fix verified: no CAR-777 item, rule error log empty
+├── lambda-functions-list.png                                  # Lambda functions list: vehicle-telemetry-transform, Python 3.12
+├── lambda-transform-function-page.png                         # Lambda function page with the validation code
+├── cloudwatch-alarms-overview.png                             # CloudWatch overview with the stack alarms
+├── cloudwatch-dashboards-list.png                             # CloudWatch dashboards list
+├── cloudwatch-dashboard-live-data.png                         # dashboard vehicle-telemetry with live data
+├── cloudwatch-dashboard-alarm-detail.png                      # dashboard with the transform-errors alarm detail
+├── dynamodb-pitr-and-device-policy.png                        # point-in-time recovery enabled and the per-device IoT policy
+├── device-cert-positive-test-car101.png                       # device test: ten readings from CAR-101 with its certificate
+├── device-cert-spoof-test-v4.png                              # spoof test, v4 script (ended with a traceback, fixed in v4.1)
+├── athena-car102-count-zero-after-spoof.png                   # Athena: nothing accepted on CAR-102 after the spoof attempt
+├── device-cert-spoof-test-verdict-v4.1.png                    # spoof test, v4.1 script: REJECTED, the expected outcome
+├── cloudshell-errors-user-flag-and-email-placeholder.png      # early CloudShell errors (--user flag, placeholder e-mail)
+└── bedrock-validation-exception.png                           # Bedrock ValidationException (why the LLM option is OpenAI-compatible)
+```
+
+### Deployment, tests and CI
+
+The v4.1 package passes its 79 tests and cfn-lint, is deployed as an update of the same stack, and CI is green on the v4.1 commits.
+
+![79 tests passed and cfn-lint with no findings](screenshots/pytest-79-passed-cfn-lint-clean.png)
+
+![V4.1 deployed as an update of the same stack](screenshots/cloudformation-deploy-v4.1.png)
+
+![Stack resources (29 with the optional alarm off)](screenshots/cloudformation-stack-resources.png)
+
+![GitHub Actions: ci passes on the v4.1 commits](screenshots/github-actions-ci-green.png)
+
+### Ingestion: IoT Core rules and Firehose
+
+Three active topic rules on `vehicles/+/telemetry`; every rule takes the vehicle ID from the topic (`topic(2) AS vehicle_id`, v4.1).
+
+![MQTT test client subscribed to vehicles/+/telemetry](screenshots/mqtt-test-client-subscribe.png)
+
+![Live telemetry messages arriving in the MQTT test client](screenshots/mqtt-test-client-live-messages.png)
+
+![IoT rules list, three active rules](screenshots/iot-rules-list-three-rules.png)
+
+![Rule 3 SQL after v4.1: topic(2) AS vehicle_id](screenshots/iot-rule-latest-state-topic-vehicle-id-v4.1.png)
+
+![Firehose delivery stream, Direct PUT to S3](screenshots/firehose-delivery-stream-active.png)
+
+### Storage and query: S3, Glue and Athena
+
+Clean data under `telemetry/`, untouched originals under `raw/`, and the Athena table.
+
+![S3 console: the single data bucket in ap-south-1](screenshots/s3-data-bucket-console.png)
+
+![Telemetry/ (clean) next to raw/ (untouched) plus the original "flat" and -5 values in raw/](screenshots/s3-telemetry-and-raw-listing.png)
+
+![Glue database vehicle_telemetry](screenshots/glue-database.png)
+
+![Glue table telemetry, JSON, location in the data bucket](screenshots/glue-table-overview.png)
+
+![Athena: CAR-001 latest 30 readings through the validation Lambda](screenshots/athena-car001-latest-30-readings-v4.png)
+
+![Athena: 217 readings per car, schema_version 1](screenshots/athena-row-count-and-schema-version-v4.png)
+
+### Validation, schema drift and the v4.1 fix
+
+The seven CAR-900 test events show new fields kept in `extras`, bad values flagged in `dq_issues`, and a claimed vehicle ID never stored. After the v4.1 fix the latest-state table has no CAR-777 item and the rule error log is empty.
+
+![Send_test_events.py: the seven CAR-900 test events](screenshots/send-test-events-output.png)
+
+![Athena: the payload claiming CAR-777 was not stored under that ID](screenshots/athena-claimed-id-car777-count-zero.png)
+
+![Athena: new field battery_v kept in extras and readable at once](screenshots/athena-extras-new-field-battery-v.png)
+
+![Athena: the seven CAR-900 events, run twice (14 rows) with dq_issues and extras](screenshots/athena-car900-drift-result.png)
+
+![V4.1 fix verified: no CAR-777 item, rule error log empty](screenshots/dynamodb-scan-no-car777-rule-errors-empty.png)
+
+![Lambda functions list: vehicle-telemetry-transform, Python 3.12](screenshots/lambda-functions-list.png)
+
+![Lambda function page with the validation code](screenshots/lambda-transform-function-page.png)
+
+### Alerts: driver/support and operations e-mail
+
+Low-tyre alert e-mails, the second SNS topic for operations alarms, a real no-data alarm and its recovery.
+
+![Low-tyre alert e-mails, front-left falling from 27.8 to 26.5 psi](screenshots/sns-low-tyre-alert-emails-v4.png)
+
+![Operations SNS topic subscription confirmed](screenshots/sns-operations-subscription-confirmed.png)
+
+![Operations alarm e-mail (alarm state set by hand to test the path)](screenshots/ops-alarm-email-transform-errors-test.png)
+
+![Operations e-mail: real no-data alarm in ALARM](screenshots/ops-alarm-email-no-data-alarm.png)
+
+![Operations e-mail: no-data alarm back to OK](screenshots/ops-alarm-email-no-data-ok.png)
+
+### Real-time latest state in DynamoDB
+
+One item per car, overwritten on every reading.
+
+![DynamoDB items, first scan, one per car](screenshots/dynamodb-items-first-scan.png)
+
+![DynamoDB items, second scan 16 seconds later (values changed)](screenshots/dynamodb-items-second-scan.png)
+
+![DynamoDB CLI scans while the simulator ran (v4 run)](screenshots/dynamodb-cli-scans-v4.png)
+
+### Observability: CloudWatch
+
+Alarm overview and the dashboard with live data.
+
+![CloudWatch overview with the stack alarms](screenshots/cloudwatch-alarms-overview.png)
+
+![CloudWatch dashboards list](screenshots/cloudwatch-dashboards-list.png)
+
+![Dashboard vehicle-telemetry with live data](screenshots/cloudwatch-dashboard-live-data.png)
+
+![Dashboard with the transform-errors alarm detail](screenshots/cloudwatch-dashboard-alarm-detail.png)
+
+### Security and device identity
+
+Least-privilege roles, a private encrypted TLS-only bucket, point-in-time recovery, and the per-device policy with a positive test and a spoof test.
+
+![IAM console: the three stack service roles (Firehose, IoT rule, Lambda)](screenshots/iam-roles-list.png)
+
+![Public access block, AES256 encryption, DenyNonTLS bucket policy](screenshots/s3-security-block-encryption-tls-policy.png)
+
+![Point-in-time recovery enabled and the per-device IoT policy](screenshots/dynamodb-pitr-and-device-policy.png)
+
+![Device test: ten readings from CAR-101 with its certificate](screenshots/device-cert-positive-test-car101.png)
+
+![Athena: nothing accepted on CAR-102 after the spoof attempt](screenshots/athena-car102-count-zero-after-spoof.png)
+
+![Spoof test, v4.1 script: REJECTED, the expected outcome](screenshots/device-cert-spoof-test-verdict-v4.1.png)
+
+### Chatbot
+
+Keyword mode, the data-quality question, and LLM mode (sentence matches the table).
+
+![Chatbot keyword mode: lowest tyre pressure per car](screenshots/chatbot-v4-keyword-lowest-tyre.png)
+
+![Chatbot keyword mode: fuel efficiency and fuel left per car](screenshots/chatbot-v4-keyword-fuel-efficiency.png)
+
+![Chatbot keyword mode: summary for CAR-001](screenshots/chatbot-v4-keyword-vehicle-summary.png)
+
+![Chatbot data_quality question: flagged readings](screenshots/chatbot-v4-data-quality-question.png)
+
+![Chatbot LLM mode: sentence matches the table](screenshots/chatbot-v4-llm-lowest-tyre.png)
+
