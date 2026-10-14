@@ -257,7 +257,7 @@ It sends 7 events for CAR-900: valid, new fields, numbers as strings, a non-nume
 ```sql
 SELECT event_time, tyre_fl_psi, tyre_rr_psi, fuel_level_pct, dq_issues, extras FROM telemetry WHERE vehicle_id='CAR-900' ORDER BY ingest_ts;
 ```
-**Expected (7 rows):**
+**Expected (7 rows per run; running the script twice gives 14 rows with the same pattern):**
 
 | Event | Expected result |
 |---|---|
