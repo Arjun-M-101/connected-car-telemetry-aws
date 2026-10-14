@@ -5,3 +5,6 @@ __pycache__/
 *.pem
 *.key
 .aws/
+certs/
+*.pem
+*.key

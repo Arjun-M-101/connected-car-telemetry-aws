@@ -51,6 +51,10 @@ QUERIES = {
     "clutch_usage": ("Share of readings with the clutch pressed, per car",
         f"""SELECT vehicle_id, round(100.0 * count_if(clutch_pct > 0) / count(*), 1) AS clutch_pressed_pct
             FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY vehicle_id"""),
+    "data_quality": ("Data-quality problems found in incoming readings",
+        f"""SELECT dq_issues, count(*) AS readings
+            FROM telemetry WHERE {RECENT} AND dq_issues IS NOT NULL
+            GROUP BY dq_issues ORDER BY readings DESC LIMIT 20"""),
     "vehicle_summary": ("Summary of one car",
         """SELECT vehicle_id, count(*) AS readings,
                   round(avg(fuel_efficiency_kmpl), 2) AS avg_kmpl,
@@ -64,6 +68,7 @@ KEYWORDS = [  # fallback routing, first match wins
     ("fuel_efficiency", ("fuel", "mileage", "efficiency", "kmpl")),
     ("harsh_acceleration", ("harsh", "aggressive", "accelerat", "pedal")),
     ("clutch_usage", ("clutch",)),
+    ("data_quality", ("quality", "invalid", "bad data", "data problem", "dq", "malformed")),
     ("vehicle_summary", ("summary", "overview", "report")),
     ("latest_status", ("latest", "current", "status", "now", "last")),
 ]
@@ -263,7 +268,7 @@ def list_models():
 def list_llm_models():
     key = os.environ.get("LLM_API_KEY")
     if not key:
-        sys.exit("Set LLM_API_KEY first (see the runbook), then run this again.")
+        sys.exit("Set LLM_API_KEY first (see README, Playbook step 8), then run this again.")
     client = OpenAICompatClient(key, os.environ.get("LLM_BASE_URL") or GEMINI_BASE)
     try:
         names = client.list_models()

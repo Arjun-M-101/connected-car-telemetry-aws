@@ -2,3 +2,4 @@ boto3
 pytest
 sqlglot
 cfn-lint
+pyyaml

@@ -22,3 +22,22 @@ FROM telemetry WHERE accelerator_pct > 85 ORDER BY event_time DESC LIMIT 50;
 -- 6. Clutch usage share
 SELECT vehicle_id, round(100.0*count_if(clutch_pct>0)/count(*),1) AS clutch_pressed_pct
 FROM telemetry GROUP BY vehicle_id;
+
+-- ===== v4: schema drift and data quality =====
+-- 7. Readings the pipeline flagged (out of range, not numeric, id mismatch ...)
+SELECT vehicle_id, event_time, dq_issues FROM telemetry WHERE dq_issues IS NOT NULL ORDER BY ingest_ts DESC LIMIT 50;
+
+-- 8. Unknown / new sensor fields captured in `extras` (JSON text) - nothing is lost
+SELECT vehicle_id, event_time, extras FROM telemetry WHERE extras IS NOT NULL ORDER BY ingest_ts DESC LIMIT 20;
+
+-- 9. Read one new field out of `extras` without changing any table
+SELECT vehicle_id, json_extract_scalar(extras, '$.battery_v') AS battery_v, json_extract_scalar(extras, '$.fw_version') AS fw_version
+FROM telemetry WHERE extras IS NOT NULL LIMIT 20;
+
+-- 10. Which message formats are in use?
+SELECT schema_version, count(*) AS readings FROM telemetry GROUP BY schema_version;
+
+-- 11. Is every vehicle still reporting? (age of the last message per vehicle)
+SELECT vehicle_id, max(from_iso8601_timestamp(event_time)) AS last_event,
+       date_diff('minute', max(from_iso8601_timestamp(event_time)), now()) AS minutes_ago
+FROM telemetry WHERE dt >= date_format(current_date - interval '1' day, '%Y-%m-%d') GROUP BY vehicle_id ORDER BY minutes_ago DESC;
