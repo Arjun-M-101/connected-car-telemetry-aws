@@ -4,15 +4,11 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 
 > **Status:** proof of concept with production-minded foundations. The sensors are **simulated** (`simulator.py`), and a real-device-style publisher (`device_mqtt.py`) uses X.509 certificates over MQTT. Everything on the AWS side is real and is created from one CloudFormation template. All data is synthetic.
 
-### Architecture (dark)
-
-![Architecture diagram, dark mode](screenshots/AWS_Architecture_Diagram-Dark.png)
-
-### Architecture (light)
+### Architecture
 
 ![Architecture diagram, light mode](screenshots/AWS_Architecture_Diagram-Default.png)
 
-*The architecture diagrams were generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if the two ever differ.*
+*The architecture diagram was generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if it differs.*
 
 ## Contents
 1. [What it covers](#1-what-it-covers)
