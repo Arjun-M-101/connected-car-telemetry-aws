@@ -6,9 +6,9 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 
 ### Architecture
 
-![Architecture diagram, light mode](screenshots/AWS_Architecture_Diagram-Default.png)
+![Architecture diagram](screenshots/AWS_Architecture_Diagram-Default.png)
 
-*The architecture diagram was generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if it differs.*
+*The architecture diagram was generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if it differs. The design follows published patterns; see [section 12](#12-design-basis-history-and-references).*
 
 ## Contents
 1. [What it covers](#1-what-it-covers)
@@ -22,7 +22,8 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 9. [Playbook: deploy, test, verify, tear down](#9-playbook-deploy-test-verify-tear-down)
 10. [Troubleshooting](#10-troubleshooting)
 11. [Limitations and roadmap](#11-limitations-and-roadmap)
-12. [Screenshots](#12-screenshots)
+12. [Design basis, history and references](#12-design-basis-history-and-references)
+13. [Screenshots](#13-screenshots)
 
 ---
 
@@ -37,7 +38,7 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 | Report to driver / support team | SNS alert e-mail, DynamoDB latest state per car, SQL reports, chatbot |
 | AI chatbot | `chatbot.py`: 7 fixed read-only Athena queries; an LLM (any OpenAI-compatible API such as Google Gemini, or Amazon Bedrock, or OpenAI) picks the query and phrases the answer; keyword fallback without an LLM |
 | Different or bad data from real devices | validation Lambda: typed and range-checked fields, unknown fields kept in `extras`, problems flagged in `dq_issues`, original message kept in `raw/` |
-| Operations | CloudWatch dashboard, 6 alarms to a separate operations e-mail, log groups with 30-day retention |
+| Operations | CloudWatch dashboard, 5 alarms (6 with the optional no-data alarm) sent to a separate operations SNS topic, log groups with 30-day retention |
 | Security | per-device IoT policy, identity taken from the MQTT topic, TLS-only encrypted private bucket, DynamoDB point-in-time recovery, no secrets in code |
 
 ## 2. How it works
@@ -68,7 +69,7 @@ The history path (S3/Athena) is **near-real-time** (about 1 to 2 minutes, becaus
 │   ├── provision_device.sh       create an IoT thing + certificate and attach the device policy
 │   └── deprovision_device.sh     remove a device completely (run before deleting the stack)
 ├── tests/                        79 unit tests (no AWS account needed)
-├── screenshots/                  architecture diagrams (dark and light) and redacted evidence from real runs (section 12)
+├── screenshots/                  architecture diagram and redacted evidence from real runs (section 13)
 ├── docs/
 │   └── PRODUCTION_READINESS.md   gap analysis and roadmap from proof of concept to production
 ├── requirements.txt
@@ -141,7 +142,7 @@ The free tier of an external LLM API may use prompts to improve the provider's p
 ## 7. Observability
 
 * **Dashboard** `vehicle-telemetry`: messages from vehicles, IoT rule success and failure, Firehose records and delivery, data freshness, validation Lambda invocations and errors, alert e-mails, alarm status.
-* **Alarms** (to the operations e-mail topic):
+* **Alarms** (to the operations SNS topic; in this demo it e-mails the same `AlertEmail` address as the driver/support alert, and in production it would go to the operations team):
 
 | Alarm | Fires when |
 |---|---|
@@ -413,14 +414,76 @@ Then delete the LLM API key in the provider console, run `rm -rf certs __pycache
 
 `docs/PRODUCTION_READINESS.md` lists, area by area, what is built and what a production roll-out needs, the challenges of real hardware, and a phased plan.
 
-## 12. Screenshots
+## 12. Design basis, history and references
+
+### Where the design comes from
+The architecture combines patterns that AWS and the IoT community publish for device telemetry, sized for a low-cost proof of concept. Numbers in brackets refer to the reference list below.
+
+| Decision | Choice in this project | Published pattern or reason |
+|---|---|---|
+| Device to cloud | MQTT over TLS into AWS IoT Core, one X.509 certificate per vehicle | lightweight publish/subscribe protocol for devices on unreliable networks; managed broker with device identity and rules [1][2][3] |
+| Topic and identity | `vehicles/<id>/telemetry`, vehicle id read with `topic(2)` | put the thing name in every device topic; topic function and policy variables make the topic the trusted identity [4][5][6] |
+| History (cold path) | IoT rule -> Firehose -> S3 -> Glue table -> Athena | published AWS IoT analytics pattern; the AWS Connected Vehicle Solution also landed raw vehicle data in S3 through Firehose [7][8][9] |
+| Table | Glue table in the template with partition projection, no crawler | no crawler or partition maintenance; types cannot change by accident [10] |
+| Latest state (hot path) | third IoT rule writes one item per car to DynamoDB | fast "latest" view next to the full history (batch and speed split); AWS connected-vehicle guidance keeps vehicle state in DynamoDB; Device Shadow considered [2][11][12] |
+| Imperfect data | validation Lambda in Firehose, raw copy, `extras`, `dq_issues`, no automatic schema change | Firehose transformation; land raw data first and never edit it; reviewed schema evolution, schema registry later [13][14][15][16] |
+| Sensor fields | tyre pressures, pedals, speed, fuel level, km/l | fuel level, accelerator and speed are standard OBD-II PIDs; tyre pressure comes from the TPMS; VSS is the standard signal catalogue [17][18][19] |
+| Low-tyre alert | SNS e-mail below 28 psi (parameter `LowTyrePsi`) | TPMS regulations warn at 25% below the recommended pressure (US FMVSS 138; India AIS-154) [20][21][22] |
+| AI chatbot | LLM picks one of 7 fixed read-only queries, never writes SQL | OWASP Top 10 for LLM applications: prompt injection and excessive agency [23] |
+| Operations and security | dashboard, alarms, logs, least privilege, TLS-only encrypted bucket, PITR | Well-Architected IoT Lens and service security best practices [24][25] |
+| Not used | AWS IoT FleetWise, Kinesis Data Streams, MSK, Flink | FleetWise is closed to new customers; AWS points to Connected Mobility guidance, which uses MSK and Flink for fleet scale [26][19] |
+
+### How the project evolved
+| Version | Trigger | What changed | Tests |
+|---|---|---|---|
+| v1 | the brief: sensor -> AWS service -> table, three sensor groups | IoT Core, Firehose, S3, Glue, Athena; low-tyre e-mail; simulator with a leak scenario | - |
+| v2 | is a 60-second buffer "real time"? and a suggestion to try an AI chatbot | DynamoDB latest state; chatbot with fixed queries and keyword fallback; CI | 27 |
+| v3 | Bedrock blocked on the account; no paid OpenAI balance | OpenAI-compatible LLM client with a free Gemini key | 39 |
+| v4 | different data from real devices, real hardware, production grade, observability, security | validation Lambda and raw copy, dashboard and alarms, device policy and X.509 publisher, playbook | 70 |
+| v4.1 | issues found in the live v4 run | every rule takes the vehicle id from the topic; clearer test output; verified on AWS | 79 |
+
+### References
+All links were opened and checked on 15 October 2026.
+
+1. OASIS, [MQTT Version 3.1.1](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html) (OASIS Standard, 2014)
+2. AWS, [Guidance for Connected Vehicles on AWS](https://aws.amazon.com/solutions/guidance/connected-vehicles-on-aws/)
+3. A. Al-Fuqaha et al., [Internet of Things: A Survey on Enabling Technologies, Protocols, and Applications](https://doi.org/10.1109/COMST.2015.2444095), IEEE Communications Surveys & Tutorials 17(4), 2015
+4. AWS whitepaper, [Designing MQTT Topics for AWS IoT Core: MQTT design best practices](https://docs.aws.amazon.com/whitepapers/latest/designing-mqtt-topics-aws-iot-core/mqtt-design-best-practices.html)
+5. AWS, [AWS IoT SQL functions (topic)](https://docs.aws.amazon.com/iot/latest/developerguide/iot-sql-functions.html)
+6. AWS, [AWS IoT Core thing policy variables](https://docs.aws.amazon.com/iot/latest/developerguide/thing-policy-variables.html)
+7. B. Snively, AWS Big Data Blog, [Derive Insights from IoT in Minutes using AWS IoT, Amazon Kinesis Firehose, Amazon Athena, and Amazon QuickSight](https://aws.amazon.com/blogs/big-data/derive-insights-from-iot-in-minutes-using-aws-iot-amazon-kinesis-firehose-amazon-athena-and-amazon-quicksight)
+8. C. Rec, AWS IoT Blog, [Building Connected Vehicle Solutions on the AWS Cloud](https://aws.amazon.com/blogs/iot/building-connected-vehicle-solutions-on-the-aws-cloud/)
+9. GitHub, [aws-solutions/aws-connected-vehicle-solution](https://github.com/aws-solutions/aws-connected-vehicle-solution) (archived reference implementation)
+10. AWS, [Partition projection with Amazon Athena](https://docs.aws.amazon.com/athena/latest/ug/partition-projection.html)
+11. J. Kreps, [Questioning the Lambda Architecture](https://www.oreilly.com/ideas/questioning-the-lambda-architecture), O'Reilly, 2014
+12. AWS, [AWS IoT Device Shadow service](https://docs.aws.amazon.com/iot/latest/developerguide/iot-device-shadows.html)
+13. AWS, [Amazon Data Firehose: transform source data](https://docs.aws.amazon.com/firehose/latest/dev/data-transformation.html)
+14. M. Armbrust et al., [Lakehouse: A New Generation of Open Platforms that Unify Data Warehousing and Advanced Analytics](https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf), CIDR 2021
+15. M. Kleppmann, *Designing Data-Intensive Applications*, O'Reilly, 2017 (chapter 4, schema evolution)
+16. AWS, [AWS Glue Schema Registry](https://docs.aws.amazon.com/glue/latest/dg/schema-registry.html)
+17. [OBD-II PIDs](https://en.wikipedia.org/wiki/OBD-II_PIDs) (SAE J1979 parameter list)
+18. COVESA, [Vehicle Signal Specification](https://github.com/COVESA/vehicle_signal_specification)
+19. AWS, [Guidance for Connected Mobility on AWS](https://docs.aws.amazon.com/guidance/latest/connected-mobility-on-aws/solution-overview.html)
+20. US Federal Register, [FMVSS No. 138, Tire Pressure Monitoring Systems](https://www.federalregister.gov/documents/2005/04/08/05-6741/federal-motor-vehicle-safety-standards-tire-pressure-monitoring-systems-controls-and-displays) (70 FR 18136, 2005)
+21. TUV Rheinland, [India AIS-154: TPMS type approval requirements](https://www.tuv.com/regulations-and-standards/en/india-ais-154-type-approval-requirements-for-vehicles-with-regard-to-their-tyre-pressure-monitoring-systems-tpms.html)
+22. J. Guerrero-Ibanez, S. Zeadally, J. Contreras-Castillo, [Sensor Technologies for Intelligent Transportation Systems](https://www.mdpi.com/1424-8220/18/4/1212), Sensors 18(4), 2018
+23. OWASP, [Top 10 for LLM Applications 2025](https://genai.owasp.org/llm-top-10/)
+24. AWS, [Well-Architected IoT Lens](https://docs.aws.amazon.com/wellarchitected/latest/iot-lens/iot-lens.html)
+25. AWS, [Security best practices for Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html) and [Security in AWS IoT Core](https://docs.aws.amazon.com/iot/latest/developerguide/security.html)
+26. AWS, [AWS IoT FleetWise availability change](https://docs.aws.amazon.com/iot-fleetwise/latest/developerguide/iotfleetwise-availability-change.html)
+27. AWS, [AWS IoT Device SDK v2 for Python](https://github.com/aws/aws-iot-device-sdk-python-v2) (used by `device_mqtt.py`)
+
+The AWS service documentation used to build and run each part (IoT Core, Firehose, Glue, Athena, DynamoDB, SNS, Lambda, CloudWatch, CloudFormation) is listed in the project's implementation guide.
+
+**AI use.** The code, template, tests and documentation were drafted with an AI assistant (Claude) and the architecture diagram with ChatGPT. I deployed and ran every version in my own AWS account, found and fixed the failures, and checked the design against the sources above.
+
+## 13. Screenshots
 
 Evidence from real runs in my own AWS account (region ap-south-1). All data is synthetic. Account ID, e-mail address, ARNs that contain the account ID, the IoT endpoint and source IP addresses are covered with black boxes. File names containing `v3` come from the first version and are kept as history; `v4` marks the v4 run and `v4.1` the v4.1 re-test that verified the fix. The step-by-step commands that produce each screenshot are in the [playbook](#9-playbook-deploy-test-verify-tear-down).
 
 ```
 screenshots/
-├── AWS_Architecture_Diagram-Dark.png      architecture diagram, dark mode (AI-generated, author-checked)
-├── AWS_Architecture_Diagram-Default.png   architecture diagram, light mode
+├── AWS_Architecture_Diagram-Default.png   architecture diagram (AI-generated, author-checked)
 ├── iam-roles-list.png                                         # IAM console: the three stack service roles (Firehose, IoT rule, Lambda)
 ├── s3-data-bucket-console.png                                 # S3 console: the single data bucket in ap-south-1
 ├── s3-telemetry-first-object-listing-v3.png                   # first telemetry object after the 5-batch smoke test (v3 run)
