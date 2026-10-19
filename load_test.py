@@ -4,7 +4,7 @@ then the script measures how long the newest reading takes to appear in DynamoDB
 Usage (CloudShell, stack deployed):  python3 load_test.py --vehicles 100 --seconds 60
 Vehicles are named LT-0001 ... so they never mix with the demo cars CAR-001 ... in queries.
 Cost: 100 vehicles x 60 s = 6,000 messages, well under one US cent of IoT Core, Kinesis and Lambda charges."""
-import argparse, json, statistics, threading, time
+import argparse, json, threading, time
 from concurrent.futures import ThreadPoolExecutor
 import boto3
 from botocore.config import Config
@@ -98,7 +98,7 @@ def main():
     if e2e:
         print(json.dumps({"vehicles": a.vehicles, "seconds": a.seconds, "sent": sent, "msg_per_s": round(sent / took),
                           "errors": len(errors), "publish_p95_ms": round(pct(pub_ms, 95)),
-                          "e2e_p50_ms": round(statistics.median(e2e)), "e2e_p95_ms": round(pct(e2e, 95))}))
+                          "e2e_p50_ms": round(pct(e2e, 50)), "e2e_p95_ms": round(pct(e2e, 95))}))
 
 
 if __name__ == "__main__":

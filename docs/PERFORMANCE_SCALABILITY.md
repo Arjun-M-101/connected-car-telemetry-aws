@@ -81,6 +81,8 @@ One conditional `UpdateItem` takes roughly 5-10 ms inside the region, so one bat
 | Alert e-mail | seconds, but once per reading | seconds after the first low reading, then de-duplicated |
 | History (Athena) | 1-2 min (60 s buffers) | 2-3 min with the demo buffer; 5-15 min with a production buffer (fewer, larger files) |
 
+**Measured on 19 Oct 2026:** `load_test.py --vehicles 100 --seconds 60` sent 6,000 of 6,000 readings in 62.5 s (96 msg/s), 0 publish errors, publish p50 35 ms / p95 68 ms, newest reading in DynamoDB p50 3.0 s / p95 4.1 s (an upper bound: it includes 0.2 s polling). `resilience_test.py --athena` passed 11 of 11 checks. The offline check sent one summary e-mail for 102 stopped test cars.
+
 The trade-off is deliberate: real-time needs use DynamoDB; Athena is for reports, where a few minutes do not matter and bigger files cost less.
 
 ## 4. Why Kinesis Data Streams, and not Amazon MSK or Firehose alone
@@ -136,7 +138,7 @@ Prices differ by region; check the AWS pricing pages for ap-south-1 before quoti
 3. **The two consumers:** Firehose writes Parquet for Athena (cheaper, faster scans); the state Lambda keeps the newest valid reading per car and decides alerts with cool-down and hysteresis.
 4. **Real-world data:** duplicates, late data, wrong clocks, impossible values, dropouts and silent cars are each handled, and each has a test (section 5).
 5. **Operations:** failures retry, then go to a dead-letter queue; 12 alarms cover throttling, lag, conversion and errors.
-6. **Proof:** 108 unit tests, cfn-lint, `load_test.py` (throughput and p50/p95 latency) and `resilience_test.py` on the live stack.
+6. **Proof:** 109 unit tests, cfn-lint, `load_test.py` (throughput and p50/p95 latency) and `resilience_test.py` on the live stack.
 7. **Still open, and why:** multi-account CD, organisation security services, real hardware, a 10,000-car test and a UI (section 9). These need an organisation, not more code.
 
 ## 8. Is v5.0 production grade?

@@ -32,25 +32,25 @@ RECENT = "dt >= date_format(current_date - interval '2' day, '%Y-%m-%d')"
 VEHICLE_RE = re.compile(r"^CAR-\d{3}$")
 
 QUERIES = {
-    "latest_status": ("Latest reading for every car",
+    "latest_status": ("Latest reading per car (first 25 cars)",
         f"""SELECT vehicle_id, event_time, tyre_fl_psi, tyre_fr_psi, tyre_rl_psi, tyre_rr_psi,
                    speed_kmph, fuel_level_pct, fuel_efficiency_kmpl
             FROM (SELECT *, row_number() OVER (PARTITION BY vehicle_id ORDER BY ingest_ts DESC) rn
-                  FROM telemetry WHERE {RECENT}) WHERE rn = 1 ORDER BY vehicle_id"""),
-    "lowest_tyre": ("Lowest tyre pressure seen per car",
+                  FROM telemetry WHERE {RECENT}) WHERE rn = 1 ORDER BY vehicle_id LIMIT 25"""),
+    "lowest_tyre": ("Lowest tyre pressure seen per car (10 lowest cars)",
         f"""SELECT vehicle_id, min(least(tyre_fl_psi, tyre_fr_psi, tyre_rl_psi, tyre_rr_psi)) AS min_psi,
                    count_if(least(tyre_fl_psi, tyre_fr_psi, tyre_rl_psi, tyre_rr_psi) < 28) AS readings_below_28_psi
-            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY min_psi"""),
-    "fuel_efficiency": ("Average fuel efficiency and fuel left per car",
+            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY min_psi LIMIT 10"""),
+    "fuel_efficiency": ("Average fuel efficiency and fuel left per car (10 best cars)",
         f"""SELECT vehicle_id, round(avg(fuel_efficiency_kmpl), 2) AS avg_kmpl,
                    round(min(fuel_level_pct), 1) AS fuel_left_pct
-            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY avg_kmpl DESC"""),
-    "harsh_acceleration": ("Hard acceleration (accelerator above 85%) per car",
+            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY avg_kmpl DESC LIMIT 10"""),
+    "harsh_acceleration": ("Hard acceleration (accelerator above 85%) per car (10 highest)",
         f"""SELECT vehicle_id, count_if(accelerator_pct > 85) AS harsh_events, count(*) AS readings
-            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY harsh_events DESC"""),
-    "clutch_usage": ("Share of readings with the clutch pressed, per car",
+            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY harsh_events DESC LIMIT 10"""),
+    "clutch_usage": ("Share of readings with the clutch pressed, per car (first 25 cars)",
         f"""SELECT vehicle_id, round(100.0 * count_if(clutch_pct > 0) / count(*), 1) AS clutch_pressed_pct
-            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY vehicle_id"""),
+            FROM telemetry WHERE {RECENT} GROUP BY vehicle_id ORDER BY vehicle_id LIMIT 25"""),
     "data_quality": ("Data-quality problems found in incoming readings",
         f"""SELECT dq_issues, count(*) AS readings
             FROM telemetry WHERE {RECENT} AND dq_issues IS NOT NULL

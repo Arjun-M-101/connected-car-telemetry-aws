@@ -215,3 +215,10 @@ def test_ask_with_compat_llm_end_to_end(monkeypatch):
     a = FakeAthena(["vehicle_id", "min_psi"], [["CAR-001", "23.7"]])
     out = c.ask("Which car has the lowest tyre pressure and is it a problem?", a, c.OpenAICompatClient("k"), "m")
     assert out.startswith("CAR-001 is below 28 psi") and "tyre" in a.sql.lower()
+
+
+def test_fleet_queries_are_bounded():
+    # v5.0: at 10,000 cars an unbounded answer is unreadable and an unbounded LLM prompt is costly
+    for name in c.QUERIES:
+        if name != "vehicle_summary":
+            assert " LIMIT " in c.build_sql(name, "CAR-001").upper(), name

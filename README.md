@@ -75,7 +75,7 @@ The history path (S3/Athena) is **near-real-time** (about 2 minutes with the dem
 │   ├── provision_device.sh       create an IoT thing + certificate and attach the device policy (safe to re-run)
 │   ├── deprovision_device.sh     remove one device and EVERY certificate attached to it (asks AWS)
 │   └── teardown.sh               delete the whole project, fix what blocks the delete, prove nothing is left
-├── tests/                        108 unit tests (no AWS account needed)
+├── tests/                        109 unit tests (no AWS account needed)
 ├── screenshots/                  architecture diagram and redacted evidence from real runs (section 13)
 ├── docs/
 │   ├── PRODUCTION_READINESS.md   gap analysis and roadmap from proof of concept to production
@@ -181,7 +181,7 @@ The free tier of an external LLM API may use prompts to improve the provider's p
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest -q          # 108 passed, no AWS account needed
+python3 -m pytest -q          # 109 passed, no AWS account needed
 cfn-lint template.yaml
 ```
 
@@ -212,7 +212,7 @@ export AWS_REGION=ap-south-1 AWS_DEFAULT_REGION=ap-south-1
 pip install -q -r requirements.txt awsiotsdk        # no --user flag: CloudShell uses a virtual environment
 python3 -m pytest -q
 ```
-**Expected:** `108 passed`. **If not:** fix the failing test before going on. If pip is slow because of cfn-lint, run `pip install -q pytest sqlglot boto3 pyyaml awsiotsdk` instead.
+**Expected:** `109 passed`. **If not:** fix the failing test before going on. If pip is slow because of cfn-lint, run `pip install -q pytest sqlglot boto3 pyyaml awsiotsdk` instead.
 
 ### 1. Deploy (new stack or update in place)
 ```bash
@@ -507,7 +507,7 @@ The architecture combines patterns that AWS and the IoT community publish for de
 | v4 | different data from real devices, real hardware, production grade, observability, security | validation Lambda and raw copy, dashboard and alarms, device policy and X.509 publisher, playbook | 70 |
 | v4.1 | issues found in the live v4 run | every rule takes the vehicle id from the topic; clearer test output; verified on AWS | 79 |
 | v4.1.1 | tear-down got stuck in a live run | `scripts/teardown.sh`: one re-runnable command that finds every certificate and the bucket itself and verifies the result | 79 |
-| v5.0 | "make it production level" | Kinesis Data Stream in front; Parquet; state Lambda: newest valid reading wins, future clocks and impossible values rejected, alerts with cool-down, reminders and hysteresis; offline detection; retries, bisect and DLQ; 12 alarms; versioned bucket; load and resilience tests; performance and scalability analysis | 108 |
+| v5.0 | "make it production level" | Kinesis Data Stream in front; Parquet; state Lambda: newest valid reading wins, future clocks and impossible values rejected, alerts with cool-down, reminders and hysteresis; offline detection; retries, bisect and DLQ; 12 alarms; versioned bucket; load and resilience tests; performance and scalability analysis | 109 |
 
 ### References
 All links were opened and checked on 15 October 2026.
