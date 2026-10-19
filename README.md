@@ -66,14 +66,15 @@ The history path (S3/Athena) is **near-real-time** (about 1 to 2 minutes, becaus
 ├── chatbot.py                    question -> 1 of 7 fixed read-only queries -> optional LLM sentence
 ├── sql/queries.sql               report queries for the Athena console
 ├── scripts/
-│   ├── provision_device.sh       create an IoT thing + certificate and attach the device policy
-│   └── deprovision_device.sh     remove a device completely (run before deleting the stack)
+│   ├── provision_device.sh       create an IoT thing + certificate and attach the device policy (safe to re-run)
+│   ├── deprovision_device.sh     remove one device and EVERY certificate attached to it (asks AWS)
+│   └── teardown.sh               delete the whole project, fix what blocks the delete, prove nothing is left
 ├── tests/                        79 unit tests (no AWS account needed)
 ├── screenshots/                  architecture diagram and redacted evidence from real runs (section 13)
 ├── docs/
 │   └── PRODUCTION_READINESS.md   gap analysis and roadmap from proof of concept to production
 ├── requirements.txt
-└── .github/workflows/ci.yml      runs the tests and cfn-lint on every push
+└── .github/workflows/ci.yml      runs the tests, cfn-lint and a shell syntax check on every push
 ```
 
 ## 4. Message and table schema
@@ -328,6 +329,7 @@ aws iot get-policy --policy-name vehicle-device-policy --query policyDocument --
 bash scripts/provision_device.sh CAR-101
 python3 device_mqtt.py --thing CAR-101 --count 10 --interval 2
 ```
+If it prints `CAR-101 already exists in AWS with a certificate whose private key is not in certs/CAR-101/`, a certificate from an earlier session is still attached: run `bash scripts/deprovision_device.sh CAR-101`, then provision again. If it prints `already provisioned`, nothing changes and you can go on.
 **Expected:** `connected as CAR-101 ...`, `seq 1 sent` ... and `RESULT: all 10 messages sent.` After 2 minutes 📷:
 ```sql
 SELECT vehicle_id, event_time, json_extract_scalar(extras,'$.seq') AS seq, json_extract_scalar(extras,'$.fw_version') AS fw FROM telemetry WHERE vehicle_id='CAR-101' ORDER BY ingest_ts;
@@ -365,23 +367,32 @@ Other providers: set `LLM_BASE_URL` for another OpenAI-compatible API, `OPENAI_A
 3 rules, Lambda, dashboard, alarm list, S3 `telemetry/` and `raw/`, row counts, DynamoDB changing, alert e-mail, 7-row drift result, CAR-777 count 0, `extras` query, raw original, operations alarm e-mails, S3 security outputs, PITR and device policy, device test positive and negative, chatbot keyword and LLM, `79 passed`, teardown verification.
 
 ### 10. Tear down and verify nothing is left
-Stop all simulators first (Ctrl+C), set `$BUCKET` (step 1), then:
+One script does the whole tear-down. It needs nothing from earlier sessions: no `$BUCKET`, no `certs/` folder. If CloudShell times out half-way, open it again and run the same two lines; every step first checks what still exists.
 ```bash
-for T in $(ls certs 2>/dev/null); do bash scripts/deprovision_device.sh $T; done   # required before deleting the stack
-aws s3 rm s3://$BUCKET --recursive
-aws cloudformation delete-stack --stack-name vehicle-telemetry --region ap-south-1
-aws cloudformation wait stack-delete-complete --stack-name vehicle-telemetry --region ap-south-1 && echo STACK_DELETED
+cd ~/connected-car-telemetry-aws && export AWS_REGION=ap-south-1 AWS_DEFAULT_REGION=ap-south-1
+bash scripts/teardown.sh
 ```
-Verify (each line should print nothing, or "no bucket left"):
-```bash
-aws cloudformation list-stacks --stack-status-filter DELETE_FAILED CREATE_COMPLETE UPDATE_COMPLETE --query "StackSummaries[?StackName=='vehicle-telemetry'].StackName" --output text
-aws dynamodb list-tables --query "TableNames[?contains(@,'vehicle')]" --output text
-aws iot list-topic-rules --query "rules[?contains(ruleName,'vehicle')].ruleName" --output text
-aws iot list-things --query "things[].thingName" --output text
-aws logs describe-log-groups --log-group-name-prefix /vehicle-telemetry --query "logGroups[].logGroupName" --output text
-aws s3 ls | grep -i vehicle-telemetry || echo "no bucket left"
-```
-Then delete the LLM API key in the provider console, run `rm -rf certs __pycache__`, and check Billing the next day. To prove repeatability, deploy again from step 1, run steps 2 and 4, and tear down again.
+Type `DELETE` when it asks. It then, in order:
+1. stops any `simulator.py` or `device_mqtt.py` still running in CloudShell;
+2. switches off the three IoT rules, so no new data arrives while it cleans up;
+3. asks AWS for **every** certificate attached to `vehicle-device-policy` or to a `CAR-NNN` thing (also old ones from earlier sessions), detaches, deactivates and deletes them, then deletes the things;
+4. waits 75 seconds so Firehose writes its last buffer **before** the bucket is emptied;
+5. finds the data bucket itself and empties it (objects, old versions, unfinished uploads);
+6. deletes the stack and prints its status every 15 seconds; on `DELETE_FAILED` it prints the reason, fixes it (devices, device policy, bucket) and tries again, up to 3 times;
+7. removes anything that can outlive the stack and the local `certs/` keys, then checks 15 resource types one by one.
+
+**Expected (5 to 10 minutes):** `[OK] stack vehicle-telemetry deleted`, fifteen `[OK] ...: none` lines and `ALL CLEAN: nothing from vehicle-telemetry is left in ap-south-1.` 📷
+**If not:** a `[LEFT]` line names what is still there. Run `bash scripts/teardown.sh` again after a few minutes (AWS can need up to 5 minutes after a certificate is detached before the policy can be deleted). To only check, without deleting anything: `bash scripts/teardown.sh --verify`.
+
+Then, outside AWS: delete the LLM API key in Google AI Studio, run `unset LLM_API_KEY LLM_MODEL`, and check Billing the next day. DynamoDB keeps a free system backup of the deleted table for 35 days; it costs nothing and expires by itself. To prove repeatability, deploy again from step 1, run steps 2 and 4, and tear down again.
+
+**Why the old four-command tear-down got stuck** (seen on 19 Oct 2026):
+| What happened | Cause | Now |
+|---|---|---|
+| `DeleteThing ... Cannot delete. Thing CAR-101 is still attached to one or more principals` | `provision_device.sh` ran twice for CAR-101 (14 and 19 Oct). The second run overwrote `certs/CAR-101/cert_arn.txt`, so `deprovision_device.sh` removed only the new certificate; the old one stayed attached to the thing **and** to `vehicle-device-policy` | `teardown.sh` and `deprovision_device.sh` ask AWS which certificates are attached; `provision_device.sh` refuses to add a second certificate |
+| `Invalid bucket name ""` on `aws s3 rm` | a new CloudShell session, so `$BUCKET` was empty and nothing was emptied | `teardown.sh` finds the bucket from the stack (or by name) |
+| `wait stack-delete-complete` printed nothing and was stopped with Ctrl+C; the check command printed nothing | the stack could not delete the non-empty bucket or the still-attached policy; the check filter did not include `DELETE_IN_PROGRESS`, so a running or stuck delete looked finished | status printed every 15 s, `DELETE_FAILED` explained and fixed, 15 resource types checked |
+| `aws s3 ls` still showed the bucket after the stack was "gone" | same cause: the stack was in `DELETE_IN_PROGRESS`/`DELETE_FAILED`, not deleted | the final check shows `[LEFT] CloudFormation stack ... DELETE_FAILED` instead of an empty line |
 
 ## 10. Troubleshooting
 
@@ -397,8 +408,11 @@ Then delete the LLM API key in the provider console, run `rm -rf certs __pycache
 | No alert e-mail | subscription not confirmed | confirm both e-mails, check Spam |
 | Too many alert e-mails | leak run left going | Ctrl+C; alerts are not de-duplicated (known limitation) |
 | Device cannot connect | wrong thing name, policy not attached, wrong endpoint | re-run `provision_device.sh`; use the same name in `--thing` |
-| Stack delete fails on `vehicle-device-policy` | a certificate is still attached | run `deprovision_device.sh` for every thing |
-| Bucket delete fails | bucket not empty | `aws s3 rm s3://$BUCKET --recursive`, delete again |
+| `provision_device.sh`: `already exists in AWS with a certificate whose private key is not in certs/` | an older certificate from an earlier session is still attached | `bash scripts/deprovision_device.sh CAR-101`, then provision again |
+| `DeleteThing ... still attached to one or more principals` | the thing has a second (older) certificate | `bash scripts/deprovision_device.sh CAR-101` (it asks AWS for every certificate) or `bash scripts/teardown.sh` |
+| Stack in `DELETE_FAILED` (`vehicle-device-policy` or `DataBucket`) | a certificate is still attached to the policy, or the bucket is not empty (often Firehose wrote its last buffer after `aws s3 rm`) | `bash scripts/teardown.sh`: it fixes both and deletes again |
+| `wait stack-delete-complete` prints nothing for a long time | the delete is stuck or failed | Ctrl+C, then `bash scripts/teardown.sh` (shows the status and the reason) |
+| Tear-down check prints nothing but the bucket still exists | the stack is still `DELETE_IN_PROGRESS` or `DELETE_FAILED` | `bash scripts/teardown.sh --verify` |
 | `export` vs `set` | `set VAR=...` is Windows syntax | use `export VAR=...` in CloudShell |
 | LLM `HTTP 400 API key not valid` / `403` / `404` / `429` | key pasted wrong / key or API blocked / wrong model name / free-tier limit | paste again / new key in a new project / copy the name from `--list-llm-models` / wait a minute |
 | Bedrock `Error 002: Access to Bedrock models is not allowed for this account` | Bedrock blocked for the whole account | use the OpenAI-compatible option or keyword mode |
