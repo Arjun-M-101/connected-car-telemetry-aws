@@ -2,15 +2,15 @@
 
 Sensor data from connected cars flows into AWS, gets validated, and lands in queryable tables. The project adds low-tyre alerts, a real-time "latest state" view per car, operations monitoring, per-device security and a small AI chatbot that answers questions about the fleet.
 
-> **Status (v5.0, production upgrade):** the pipeline now runs on a production-style architecture: one IoT rule writes to an encrypted **Kinesis Data Stream**; Firehose reads the stream and lands **Parquet**; a **state Lambda** reads the same stream in batches and keeps the latest state per car (newest **valid** reading wins: late, duplicate, future-clock and impossible readings cannot corrupt it) and sends alerts with a cool-down, reminders and **hysteresis**; a scheduled check reports **offline** vehicles; failures retry, then land in a **dead-letter queue**; 12 alarms watch it. `load_test.py` measures throughput and latency, `resilience_test.py` proves the real-world cases on the live stack. See [docs/PERFORMANCE_SCALABILITY.md](docs/PERFORMANCE_SCALABILITY.md) for the current-vs-production analysis.
+> **Status (v5.0, production upgrade):** the pipeline now runs on a production-style architecture: one IoT rule writes to an encrypted **Kinesis Data Stream**; Firehose reads the stream and lands **Parquet**; a **state Lambda** reads the same stream in batches and keeps the latest state per car (newest **valid** reading wins: late, duplicate, future-clock and impossible readings cannot corrupt it) and sends alerts with a cool-down, reminders and **hysteresis**; a scheduled check reports **offline** vehicles; failures retry, then land in a **dead-letter queue**; 11 alarms watch it (12 with the optional no-data alarm). `load_test.py` measures throughput and latency, `resilience_test.py` proves the real-world cases on the live stack. See [docs/PERFORMANCE_SCALABILITY.md](docs/PERFORMANCE_SCALABILITY.md) for the current-vs-production analysis.
 >
 > Earlier status (v4.1): proof of concept with production-minded foundations. The sensors are **simulated** (`simulator.py`), and a real-device-style publisher (`device_mqtt.py`) uses X.509 certificates over MQTT. Everything on the AWS side is real and is created from one CloudFormation template. All data is synthetic.
 
 ### Architecture
 
-![Architecture diagram](screenshots/AWS_Architecture_Diagram-Default.png)
+![Architecture diagram v5.0](screenshots/AWS_Architecture_Diagram-Dark.png)
 
-*The architecture diagram was generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if it differs. The design follows published patterns; see [section 12](#12-design-basis-history-and-references).*
+*Architecture v5.0, drawn from `template.yaml` (light version: [AWS_Architecture_Diagram-Default.png](screenshots/AWS_Architecture_Diagram-Default.png)). The earlier v4.1 diagrams (three IoT rules) are kept as `AWS_Architecture_Diagram-Dark(old).png` and `AWS_Architecture_Diagram-Default(old).png`; they were generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if it differs. The design follows published patterns; see [section 12](#12-design-basis-history-and-references).*
 
 ## Contents
 1. [What it covers](#1-what-it-covers)
@@ -94,7 +94,7 @@ A reading from a device:
  "fuel_level_pct": 70.0, "fuel_efficiency_kmpl": 15.0}
 ```
 
-Table `vehicle_telemetry.telemetry` (JSON in S3):
+Table `vehicle_telemetry.telemetry` (Parquet in S3 since v5.0; JSON up to v4.1):
 
 | Column | Type | Notes |
 |---|---|---|
@@ -207,7 +207,8 @@ Every step lists **Expected** results and what to do **If not**. Take a screensh
 ### 0. Set up every new CloudShell session
 Upload the project zip with **Actions -> Upload file**, then:
 ```bash
-cd ~ && unzip -q -o <project zip> && cd vehicle-telemetry
+cd ~ && git clone https://github.com/Arjun-M-101/connected-car-telemetry-aws.git   # first time only
+cd ~/connected-car-telemetry-aws && git pull
 export AWS_REGION=ap-south-1 AWS_DEFAULT_REGION=ap-south-1
 pip install -q -r requirements.txt awsiotsdk        # no --user flag: CloudShell uses a virtual environment
 python3 -m pytest -q
@@ -316,7 +317,8 @@ If CAR-777 is listed, it is a stale item from a stack older than v4.1. Remove it
 The originals are still in `raw/` 📷:
 ```bash
 echo "${BUCKET:?run the BUCKET= line from step 1 first}"
-for K in $(aws s3 ls s3://$BUCKET/raw/ --recursive | tail -5 | awk '{print $4}'); do aws s3 cp s3://$BUCKET/$K - ; done | grep CAR-900 | grep -E '"flat"|-5' | head -3
+for K in $(aws s3 ls s3://$BUCKET/raw/ --recursive | tail -5 | awk '{print $4}'); do aws s3 cp s3://$BUCKET/$K - | gunzip; done \
+  | grep -oE '"tyre_fl_psi": ?"flat"|"tyre_rr_psi": ?-5' | head -3     # raw/ is GZIP since v5.0
 ```
 **Expected:** the original `"flat"` text and `-5`, which were set to null in the clean table.
 
@@ -410,7 +412,7 @@ Sends a late reading, a duplicate, a reading from a clock 2 hours ahead, an impo
 **If a check fails:** run it again once (the history check waits for Firehose); if it still fails, send the output.
 
 ### 9. Evidence checklist
-1 rule, Kinesis stream, 3 Lambdas, DLQ, resilience-test result, dashboard, alarm list, S3 `telemetry/` and `raw/`, row counts, DynamoDB changing, alert e-mail, 7-row drift result, CAR-777 count 0, `extras` query, raw original, operations alarm e-mails, S3 security outputs, PITR and device policy, device test positive and negative, chatbot keyword and LLM, `93 passed`, load-test result and dashboard, teardown verification.
+1 rule, Kinesis stream, 3 Lambdas, DLQ, resilience-test result, dashboard, alarm list, S3 `telemetry/` and `raw/`, row counts, DynamoDB changing, alert e-mail, 7-row drift result, CAR-777 count 0, `extras` query, raw original, operations alarm e-mails, S3 security outputs, PITR and device policy, device test positive and negative, chatbot keyword and LLM, `109 passed`, load-test result and dashboard, teardown verification.
 
 ### 10. Tear down and verify nothing is left
 One script does the whole tear-down. It needs nothing from earlier sessions: no `$BUCKET`, no `certs/` folder. If CloudShell times out half-way, open it again and run the same two lines; every step first checks what still exists.
@@ -420,14 +422,14 @@ bash scripts/teardown.sh
 ```
 Type `DELETE` when it asks. It then, in order:
 1. stops any `simulator.py` or `device_mqtt.py` still running in CloudShell;
-2. switches off the three IoT rules, so no new data arrives while it cleans up;
+2. switches off the IoT rule (three rules up to v4.1), so no new data arrives while it cleans up;
 3. asks AWS for **every** certificate attached to `vehicle-device-policy` or to a `CAR-NNN` thing (also old ones from earlier sessions), detaches, deactivates and deletes them, then deletes the things;
 4. waits 75 seconds so Firehose writes its last buffer **before** the bucket is emptied;
 5. finds the data bucket itself and empties it (objects, old versions, unfinished uploads);
 6. deletes the stack and prints its status every 15 seconds; on `DELETE_FAILED` it prints the reason, fixes it (devices, device policy, bucket) and tries again, up to 3 times;
-7. removes anything that can outlive the stack and the local `certs/` keys, then checks 15 resource types one by one.
+7. removes anything that can outlive the stack and the local `certs/` keys, then checks 18 resource types one by one (including the Kinesis stream, the EventBridge schedule and the SQS queue).
 
-**Expected (5 to 10 minutes):** `[OK] stack vehicle-telemetry deleted`, fifteen `[OK] ...: none` lines and `ALL CLEAN: nothing from vehicle-telemetry is left in ap-south-1.` 📷
+**Expected (5 to 10 minutes):** `[OK] stack vehicle-telemetry deleted`, eighteen `[OK] ...: none` lines and `ALL CLEAN: nothing from vehicle-telemetry is left in ap-south-1.` 📷
 **If not:** a `[LEFT]` line names what is still there. Run `bash scripts/teardown.sh` again after a few minutes (AWS can need up to 5 minutes after a certificate is detached before the policy can be deleted). To only check, without deleting anything: `bash scripts/teardown.sh --verify`.
 
 Then, outside AWS: delete the LLM API key in Google AI Studio, run `unset LLM_API_KEY LLM_MODEL`, and check Billing the next day. DynamoDB keeps a free system backup of the deleted table for 35 days; it costs nothing and expires by itself. To prove repeatability, deploy again from step 1, run steps 2 and 4, and tear down again.
@@ -437,7 +439,7 @@ Then, outside AWS: delete the LLM API key in Google AI Studio, run `unset LLM_AP
 |---|---|---|
 | `DeleteThing ... Cannot delete. Thing CAR-101 is still attached to one or more principals` | `provision_device.sh` ran twice for CAR-101 (14 and 19 Oct). The second run overwrote `certs/CAR-101/cert_arn.txt`, so `deprovision_device.sh` removed only the new certificate; the old one stayed attached to the thing **and** to `vehicle-device-policy` | `teardown.sh` and `deprovision_device.sh` ask AWS which certificates are attached; `provision_device.sh` refuses to add a second certificate |
 | `Invalid bucket name ""` on `aws s3 rm` | a new CloudShell session, so `$BUCKET` was empty and nothing was emptied | `teardown.sh` finds the bucket from the stack (or by name) |
-| `wait stack-delete-complete` printed nothing and was stopped with Ctrl+C; the check command printed nothing | the stack could not delete the non-empty bucket or the still-attached policy; the check filter did not include `DELETE_IN_PROGRESS`, so a running or stuck delete looked finished | status printed every 15 s, `DELETE_FAILED` explained and fixed, 15 resource types checked |
+| `wait stack-delete-complete` printed nothing and was stopped with Ctrl+C; the check command printed nothing | the stack could not delete the non-empty bucket or the still-attached policy; the check filter did not include `DELETE_IN_PROGRESS`, so a running or stuck delete looked finished | status printed every 15 s, `DELETE_FAILED` explained and fixed, 18 resource types checked |
 | `aws s3 ls` still showed the bucket after the stack was "gone" | same cause: the stack was in `DELETE_IN_PROGRESS`/`DELETE_FAILED`, not deleted | the final check shows `[LEFT] CloudFormation stack ... DELETE_FAILED` instead of an empty line |
 
 ## 10. Troubleshooting
@@ -490,13 +492,14 @@ The architecture combines patterns that AWS and the IoT community publish for de
 | Topic and identity | `vehicles/<id>/telemetry`, vehicle id read with `topic(2)` | put the thing name in every device topic; topic function and policy variables make the topic the trusted identity [4][5][6] |
 | History (cold path) | IoT rule -> Firehose -> S3 -> Glue table -> Athena | published AWS IoT analytics pattern; the AWS Connected Vehicle Solution also landed raw vehicle data in S3 through Firehose [7][8][9] |
 | Table | Glue table in the template with partition projection, no crawler | no crawler or partition maintenance; types cannot change by accident [10] |
-| Latest state (hot path) | third IoT rule writes one item per car to DynamoDB | fast "latest" view next to the full history (batch and speed split); AWS connected-vehicle guidance keeps vehicle state in DynamoDB; Device Shadow considered [2][11][12] |
+| Latest state (hot path) | v5.0: state Lambda reads the Kinesis stream and keeps the newest valid reading per car in DynamoDB (v4.1: a third IoT rule) | fast "latest" view next to the full history (batch and speed split); AWS connected-vehicle guidance keeps vehicle state in DynamoDB; Device Shadow considered [2][11][12] |
 | Imperfect data | validation Lambda in Firehose, raw copy, `extras`, `dq_issues`, no automatic schema change | Firehose transformation; land raw data first and never edit it; reviewed schema evolution, schema registry later [13][14][15][16] |
 | Sensor fields | tyre pressures, pedals, speed, fuel level, km/l | fuel level, accelerator and speed are standard OBD-II PIDs; tyre pressure comes from the TPMS; VSS is the standard signal catalogue [17][18][19] |
 | Low-tyre alert | SNS e-mail below 28 psi (parameter `LowTyrePsi`) | TPMS regulations warn at 25% below the recommended pressure (US FMVSS 138; India AIS-154) [20][21][22] |
 | AI chatbot | LLM picks one of 7 fixed read-only queries, never writes SQL | OWASP Top 10 for LLM applications: prompt injection and excessive agency [23] |
 | Operations and security | dashboard, alarms, logs, least privilege, TLS-only encrypted bucket, PITR | Well-Architected IoT Lens and service security best practices [24][25] |
-| Not used | AWS IoT FleetWise, Kinesis Data Streams, MSK, Flink | FleetWise is closed to new customers; AWS points to Connected Mobility guidance, which uses MSK and Flink for fleet scale [26][19] |
+| Buffer (v5.0) | IoT rule -> Kinesis Data Streams, partition key = vehicle id; Firehose and the state Lambda read it | ordered, replayable buffer with several consumers; Lambda with Kinesis (batching, bisect, on-failure destination); see docs/PERFORMANCE_SCALABILITY.md |
+| Not used | AWS IoT FleetWise, MSK, Flink | FleetWise is closed to new customers; MSK needs a VPC destination and an always-on cluster; Flink is the next step for fleet-scale stream analytics [26][19] |
 
 ### How the project evolved
 | Version | Trigger | What changed | Tests |
@@ -550,7 +553,29 @@ Evidence from real runs in my own AWS account (region ap-south-1). All data is s
 
 ```
 screenshots/
-├── AWS_Architecture_Diagram-Default.png   architecture diagram (AI-generated, author-checked)
+├── AWS_Architecture_Diagram-Dark.png      architecture diagram v5.0, dark (drawn from template.yaml; shown at the top)
+├── AWS_Architecture_Diagram-Default.png   architecture diagram v5.0, light
+├── AWS_Architecture_Diagram-Dark(old).png     v4.1 diagram, dark (AI-generated, author-checked; three IoT rules)
+├── AWS_Architecture_Diagram-Default(old).png  v4.1 diagram, light
+├── v5-pytest-and-deploy.png                                   # v5.0: tests (108 at commit b31e1f5; 109 after the last commit), cfn-lint, stack update
+├── v5-iot-rules-one-rule.png                                  # v5.0: one IoT rule, vehicle_telemetry_ingest
+├── v5-kinesis-data-stream.png                                 # v5.0: Kinesis data stream vehicle-telemetry-stream, Active
+├── v5-lambda-three-functions.png                              # v5.0: transform, state and offline-check Lambdas
+├── v5-sqs-dead-letter-queue.png                               # v5.0: dead-letter queue, 0 messages
+├── v5-cloudwatch-11-alarms-ok.png                             # v5.0: 11 alarms, all OK
+├── v5-athena-row-count-schema-version.png                     # v5.0: rows per car from the Parquet table
+├── v5-athena-lowest-tyre.png                                  # v5.0: lowest tyre pressure per car
+├── v5-athena-fuel-efficiency.png                              # v5.0: fuel efficiency per car
+├── v5-athena-car900-drift-result.png                          # v5.0: the seven CAR-900 events with dq_issues and extras
+├── v5-athena-car777-count-zero.png                            # v5.0: claimed id CAR-777 never stored
+├── v5-athena-extras-battery-v.png                             # v5.0: new field battery_v read from extras
+├── v5-dynamodb-cli-scans.png                                  # v5.0: latest state moving forward
+├── v5-sns-low-tyre-alert-car001.png                           # v5.0: ONE low-tyre e-mail for the leak run
+├── v5-sns-rt002-low-and-recovered.png                         # v5.0: resilience test, low tyre then back to normal (hysteresis)
+├── v5-load-test-result.png                                    # v5.0: 6,000 of 6,000, 0 errors, end-to-end p95 4.1 s
+├── v5-resilience-test-11-passed.png                           # v5.0: 11 of 11 resilience checks passed
+├── v5-chatbot-gemini-answers.png                              # v5.0: chatbot with Gemini (lowest tyre, injection attempt)
+├── v5-teardown-all-clean.png                                  # v5.0: teardown.sh, ALL CLEAN with 18 checks
 ├── iam-roles-list.png                                         # IAM console: the three stack service roles (Firehose, IoT rule, Lambda)
 ├── s3-data-bucket-console.png                                 # S3 console: the single data bucket in ap-south-1
 ├── s3-telemetry-first-object-listing-v3.png                   # first telemetry object after the 5-batch smoke test (v3 run)
@@ -631,7 +656,49 @@ screenshots/
 └── bedrock-validation-exception.png                           # Bedrock ValidationException (why the LLM option is OpenAI-compatible)
 ```
 
-### Deployment, tests and CI
+### v5.0 production upgrade (live run, 19 October 2026)
+
+One rule into a Kinesis stream, three Lambdas, a dead-letter queue and 11 alarms; measured with the load and resilience tests.
+
+![v5.0 tests and deploy](screenshots/v5-pytest-and-deploy.png)
+
+![v5.0 one IoT rule](screenshots/v5-iot-rules-one-rule.png)
+
+![v5.0 Kinesis data stream](screenshots/v5-kinesis-data-stream.png)
+
+![v5.0 three Lambda functions](screenshots/v5-lambda-three-functions.png)
+
+![v5.0 dead-letter queue](screenshots/v5-sqs-dead-letter-queue.png)
+
+![v5.0 11 alarms OK](screenshots/v5-cloudwatch-11-alarms-ok.png)
+
+![v5.0 load test result](screenshots/v5-load-test-result.png)
+
+![v5.0 resilience test, 11 of 11 passed](screenshots/v5-resilience-test-11-passed.png)
+
+![v5.0 one low-tyre alert](screenshots/v5-sns-low-tyre-alert-car001.png)
+
+![v5.0 low tyre then back to normal](screenshots/v5-sns-rt002-low-and-recovered.png)
+
+![v5.0 DynamoDB latest state](screenshots/v5-dynamodb-cli-scans.png)
+
+![v5.0 Athena rows per car](screenshots/v5-athena-row-count-schema-version.png)
+
+![v5.0 Athena lowest tyre](screenshots/v5-athena-lowest-tyre.png)
+
+![v5.0 Athena fuel efficiency](screenshots/v5-athena-fuel-efficiency.png)
+
+![v5.0 CAR-900 drift result](screenshots/v5-athena-car900-drift-result.png)
+
+![v5.0 CAR-777 count zero](screenshots/v5-athena-car777-count-zero.png)
+
+![v5.0 battery_v from extras](screenshots/v5-athena-extras-battery-v.png)
+
+![v5.0 chatbot with Gemini](screenshots/v5-chatbot-gemini-answers.png)
+
+![v5.0 tear-down ALL CLEAN](screenshots/v5-teardown-all-clean.png)
+
+### Deployment, tests and CI (v4.1)
 
 The v4.1 package passes its 79 tests and cfn-lint, is deployed as an update of the same stack, and CI is green on the v4.1 commits.
 
@@ -645,7 +712,7 @@ The v4.1 package passes its 79 tests and cfn-lint, is deployed as an update of t
 
 ### Ingestion: IoT Core rules and Firehose
 
-Three active topic rules on `vehicles/+/telemetry`; every rule takes the vehicle ID from the topic (`topic(2) AS vehicle_id`, v4.1).
+v4.1 run: three active topic rules on `vehicles/+/telemetry` (v5.0 has one rule with a Kinesis action); every rule takes the vehicle ID from the topic (`topic(2) AS vehicle_id`, v4.1).
 
 ![MQTT test client subscribed to vehicles/+/telemetry](screenshots/mqtt-test-client-subscribe.png)
 
@@ -707,7 +774,7 @@ Low-tyre alert e-mails, the second SNS topic for operations alarms, a real no-da
 
 ### Real-time latest state in DynamoDB
 
-One item per car, overwritten on every reading.
+One item per car (v4.1 run: overwritten on every reading; since v5.0 only by a newer valid reading).
 
 ![DynamoDB items, first scan, one per car](screenshots/dynamodb-items-first-scan.png)
 
