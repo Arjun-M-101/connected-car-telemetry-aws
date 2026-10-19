@@ -553,10 +553,10 @@ Evidence from real runs in my own AWS account (region ap-south-1). All data is s
 
 ```
 screenshots/
-├── AWS_Architecture_Diagram-Dark.png      architecture diagram v5.0, dark (drawn from template.yaml; shown at the top)
-├── AWS_Architecture_Diagram-Default.png   architecture diagram v5.0, light
-├── AWS_Architecture_Diagram-Dark(old).png     v4.1 diagram, dark (AI-generated, author-checked; three IoT rules)
-├── AWS_Architecture_Diagram-Default(old).png  v4.1 diagram, light
+├── AWS_Architecture_Diagram-Dark.png                          # architecture diagram v5.0, dark (drawn from template.yaml; shown at the top)
+├── AWS_Architecture_Diagram-Default.png                       # architecture diagram v5.0, light
+├── AWS_Architecture_Diagram-Dark(old).png                     # v4.1 diagram, dark (AI-generated, author-checked; three IoT rules)
+├── AWS_Architecture_Diagram-Default(old).png                  # v4.1 diagram, light
 ├── v5-pytest-and-deploy.png                                   # v5.0: tests (108 at commit b31e1f5; 109 after the last commit), cfn-lint, stack update
 ├── v5-iot-rules-one-rule.png                                  # v5.0: one IoT rule, vehicle_telemetry_ingest
 ├── v5-kinesis-data-stream.png                                 # v5.0: Kinesis data stream vehicle-telemetry-stream, Active
