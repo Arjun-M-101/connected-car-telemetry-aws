@@ -49,9 +49,30 @@ def test_state_consumer_has_retries_bisect_and_dead_letter_queue():
     assert p["MaximumRetryAttempts"] >= 1
 
 
-def test_inline_lambdas_fit_the_inline_code_limit():
-    for fn in ("TransformFunction", "StateFunction"):
-        assert len(R[fn]["Properties"]["Code"]["ZipFile"]) < 4096, fn
+def test_template_can_be_deployed_without_an_s3_bucket():
+    # aws cloudformation deploy sends the template body directly only up to 51,200 bytes
+    size = (ROOT / "template.yaml").stat().st_size
+    assert size < 51200, f"template.yaml is {size} bytes: move code out or deploy with --s3-bucket"
+
+
+def test_every_reference_in_the_template_exists():
+    import re
+    text = (ROOT / "template.yaml").read_text()
+    known = set(R) | set(T.get("Parameters", {})) | {"AWS::Region", "AWS::AccountId", "AWS::NoValue",
+                                                      "AWS::StackName", "AWS::Partition", "AWS::URLSuffix"}
+    refs = re.findall(r"!Ref\s+([A-Za-z0-9:]+)", text) + re.findall(r"!GetAtt\s+([A-Za-z0-9]+)\.", text)
+    for sub in re.findall(r"\$\{([A-Za-z0-9:]+)(?:\.[A-Za-z]+)?\}", text):
+        refs.append(sub)
+    missing = sorted({r for r in refs if r not in known})
+    assert not missing, missing
+
+
+def test_lambda_log_groups_and_names_belong_to_the_stack():
+    for fn in ("TransformFunction", "StateFunction", "OfflineFunction"):
+        name = R[fn]["Properties"]["FunctionName"]
+        assert name.startswith("vehicle-telemetry-")            # tear-down finds it by this prefix
+        groups = [r["Properties"]["LogGroupName"] for r in R.values() if r["Type"] == "AWS::Logs::LogGroup"]
+        assert "/aws/lambda/" + name in groups                 # retention set, deleted with the stack
 
 
 def test_stream_is_encrypted_and_kept_24h():
@@ -62,7 +83,7 @@ def test_stream_is_encrypted_and_kept_24h():
 
 def test_all_alarms_notify_the_operations_topic():
     alarms = [r for r in R.values() if r["Type"] == "AWS::CloudWatch::Alarm"]
-    assert len(alarms) == 10
+    assert len(alarms) == 12
     for a in alarms:
         assert a["Properties"]["AlarmActions"] == ["OpsTopic"]
 

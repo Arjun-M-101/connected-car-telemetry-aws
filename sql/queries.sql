@@ -41,3 +41,15 @@ SELECT schema_version, count(*) AS readings FROM telemetry GROUP BY schema_versi
 SELECT vehicle_id, max(from_iso8601_timestamp(event_time)) AS last_event,
        date_diff('minute', max(from_iso8601_timestamp(event_time)), now()) AS minutes_ago
 FROM telemetry WHERE dt >= date_format(current_date - interval '1' day, '%Y-%m-%d') GROUP BY vehicle_id ORDER BY minutes_ago DESC;
+
+-- telemetry_dedup (v5.0): one row per (vehicle, event_time). QoS 1 and the device outbox can deliver a reading
+-- twice; the raw history keeps both on purpose (nothing is lost), reports should use this form.
+SELECT * FROM (
+  SELECT t.*, row_number() OVER (PARTITION BY vehicle_id, event_time ORDER BY ingest_ts) AS rn
+  FROM telemetry t
+  WHERE dt >= date_format(current_date - interval '2' day, '%Y-%m-%d')
+) WHERE rn = 1;
+
+-- clock and time problems flagged by the validation Lambda (v5.0)
+SELECT vehicle_id, event_time, dq_issues FROM telemetry
+WHERE dq_issues LIKE '%event_time%' AND dt >= date_format(current_date - interval '2' day, '%Y-%m-%d');

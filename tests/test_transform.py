@@ -28,7 +28,7 @@ def good(**kw):
     m = {"vehicle_id": "CAR-001", "event_time": "2026-10-14T10:00:00+00:00",
          "tyre_fl_psi": 33.1, "tyre_fr_psi": 33.0, "tyre_rl_psi": 32.9, "tyre_rr_psi": 33.2,
          "accelerator_pct": 20.0, "clutch_pct": 0.0, "speed_kmph": 50.0,
-         "fuel_level_pct": 70.0, "fuel_efficiency_kmpl": 15.0, "ingest_ts": 1791000000000}
+         "fuel_level_pct": 70.0, "fuel_efficiency_kmpl": 15.0, "ingest_ts": 1791972001000}  # 1 s after event_time
     m.update(kw)
     return m
 
@@ -141,3 +141,20 @@ def test_device_policy_is_per_thing_scoped():
     for s in doc["Statement"]:
         assert "ThingName" in s["Resource"], s
         assert "*" not in s["Resource"].replace("commands/*", "")
+
+
+def test_event_time_in_other_iso_formats_is_accepted(mod):
+    for t in ("2026-10-14T10:00:00Z", "2026-10-14T10:00:00.250+00:00", "2026-10-14T15:30:00+05:30"):
+        (res, row), = run(mod, good(event_time=t))
+        assert res == "Ok" and row["dq_issues"] is None, t
+
+
+def test_unparseable_or_zoneless_event_time_is_flagged(mod):
+    for t in ("yesterday", "2026-10-14 10:00", "2026-10-14T10:00:00"):
+        (res, row), = run(mod, good(event_time=t))
+        assert res == "Ok" and row["dq_issues"] == "bad_event_time", t
+
+
+def test_device_clock_far_ahead_is_flagged(mod):
+    (res, row), = run(mod, good(event_time="2026-10-14T11:00:00+00:00"))   # 1 h ahead of ingest_ts
+    assert row["dq_issues"] == "future_event_time"

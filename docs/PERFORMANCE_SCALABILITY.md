@@ -9,10 +9,11 @@ This document explains where the v4.1 design stops scaling, why, and what v5.0 c
 |---|---|---|
 | Ingestion | IoT Core, **3 topic rules**, each runs on every message | IoT Core, **1 topic rule** -> **Kinesis Data Stream** (encrypted, 24 h retention, partition key = vehicle id) |
 | History path | rule -> Firehose **Direct PUT** (one `PutRecord` per message) -> Lambda -> **JSON** in S3, 60 s / 1 MB buffer | Firehose **reads the stream** -> same validation Lambda -> **Parquet (Snappy)**, 64 MB / 60-900 s buffer; raw copy **GZIP** |
-| Latest state | rule -> DynamoDB `PutItem` (**last message wins**, even if older) | state Lambda, batches of up to 100, **conditional write: newest `event_time` wins**, idempotent on retry |
-| Alerts | rule -> SNS on **every** reading below 28 psi | state Lambda -> SNS **once per car per 15 min** (conditional `alert_until`), no alerts from late or replayed readings |
+| Latest state | rule -> DynamoDB `PutItem` (**last message wins**, even if older; times compared as text; any value stored) | state Lambda, batches of up to 100, **conditional write on event time in epoch ms: newest valid reading wins**, range-checked values, clock more than 5 min ahead rejected, idempotent on retry |
+| Alerts | rule -> SNS on **every** reading below 28 psi | state Lambda -> SNS: first alert at once, a reminder every 15 min while low, **hysteresis** (clears only at 29 psi) and a 'back to normal' message; never from late, replayed, future-clock or impossible readings |
+| Fleet health | none | **offline detection** every 5 min (one summary e-mail, metric `VehiclesOffline`) |
 | Failure handling | rule error log only | retries, batch bisection, per-record failure reporting, **SQS dead-letter queue** + alarm |
-| Observability | 5 alarms (+1 optional) | 9 alarms (+1 optional) incl. stream throttling, consumer lag, DLQ; custom metrics (updated, stale, alerts sent/suppressed) |
+| Observability | 5 alarms (+1 optional) | 11 alarms (+1 optional) incl. stream throttling, consumer lag, DLQ, Parquet conversion, offline-check errors; custom metrics (updated, stale, bad time, future skew, alerts sent/suppressed/recovered, vehicles offline) |
 | Data protection | SSE-S3, TLS-only bucket, PITR | + bucket versioning, stream KMS encryption, encrypted DLQ, DynamoDB SSE, IA tiering after 30 days |
 
 ## 2. Limitations and drawbacks of v4.1
@@ -58,7 +59,7 @@ Where v4.1 stops:
 | 7. JSON scans | Parquet + Snappy | Athena reads only the needed columns, compressed: typically **several times (often 5-10x) fewer bytes scanned** for column-subset reports **[estimate; check "Data scanned" in Athena]** |
 | 8. Small files | 64 MB buffer, interval a parameter (300-900 s in production) | fewer, larger files; next step compaction or Apache Iceberg |
 | 9. Raw copy uncompressed | GZIP | raw storage roughly 5-10x smaller for JSON text **[estimate]** |
-| 10. No lag/failure signals | alarms: stream throttled, consumer lag > 60 s, DLQ not empty, state errors; custom metrics | problems page operations within minutes |
+| 10. No lag/failure signals | alarms: stream throttled, consumer lag > 60 s, DLQ not empty, Parquet conversion failed, Lambda errors; custom metrics | problems page operations within minutes |
 
 ### 3.1 Sizing the stream **[estimate]**
 Shards needed (PROVISIONED) = max(messages/s / 1,000, MB/s / 1). Our 320-byte readings hit the record limit first:
@@ -82,19 +83,80 @@ One conditional `UpdateItem` takes roughly 5-10 ms inside the region, so one bat
 
 The trade-off is deliberate: real-time needs use DynamoDB; Athena is for reports, where a few minutes do not matter and bigger files cost less.
 
-## 4. What v5.0 still does not do
+## 4. Why Kinesis Data Streams, and not Amazon MSK or Firehose alone
+
+PRODUCTION_READINESS.md (v4) listed "Kinesis Data Streams **or** MSK". v5.0 uses **Kinesis Data Streams**. The comparison:
+
+| Criterion | Firehose Direct PUT only (v4.1) | **Kinesis Data Streams (v5.0)** | Amazon MSK (Kafka) |
+|---|---|---|---|
+| IoT Core integration | rule action, one `PutRecord` per message | rule action `Kinesis`, partition key from the topic | rule action `Kafka` needs a **VPC destination** (network interfaces in your subnets) |
+| Servers to run | none | none (serverless; PROVISIONED shards or ON_DEMAND) | brokers (Provisioned) or a Serverless cluster, always inside a VPC |
+| Replay | none | 24 h by default (up to 365 days) | retention configurable, days to unlimited |
+| Ordering | none | per partition key (vehicle) | per partition (vehicle as key) |
+| Several consumers | one destination | yes: Firehose + Lambda now; Managed Flink later; enhanced fan-out if needed | yes, consumer groups |
+| Scaling unit | delivery-stream quota | shard: 1 MB/s or 1,000 records/s in; ON_DEMAND scales automatically | partitions and broker size |
+| Minimum cost while idle | none | one shard-hour (cents per hour) | brokers or cluster-hours running 24x7 (much higher) |
+| Operations skills | low | low | Kafka skills: partitions, ACLs, upgrades, VPC networking |
+
+**Decision:** Kinesis Data Streams gives the three things v4.1 lacked (a durable buffer with replay, per-vehicle ordering, several independent consumers) without servers, VPC networking or a 24x7 cluster. MSK is the better choice only when the organisation already runs Kafka (existing producers and consumers, Kafka Connect, MirrorMaker) or needs retention and tooling Kinesis does not offer. Firehose alone stays, but behind the stream.
+
+## 5. Real-world correctness: what real cars do, and what each version does
+
+| What real devices do | v4.1 result | v5.0 result | Proven by |
+|---|---|---|---|
+| Re-deliver a message (QoS 1, outbox) | latest state fine; one more alert e-mail | harmless: same reading, alert cool-down; history keeps both, reports use `telemetry_dedup` | `test_same_reading_twice_is_harmless`, resilience check 2 |
+| Send an older reading late (outbox after a tunnel) | **latest state goes back in time** | ignored for the latest state (event time in ms compared); kept in history | `test_late_or_replayed...`, resilience check 1 |
+| Clock far ahead (RTC fault, 2030) | stored as latest | **rejected** for the latest state (more than 5 min ahead of AWS) and flagged `future_event_time` in history; otherwise that one reading would block every later update | `test_device_clock_in_the_future...`, resilience check 3 |
+| Different time formats (`Z`, milliseconds, +05:30) | compared as text: wrong order possible | parsed to epoch ms; a time without a zone is flagged `bad_event_time` | `test_times_in_different_formats...` |
+| Impossible value (-5 psi, 900 km/h) | stored in DynamoDB and **could raise an alert** | not stored, no alert; flagged `out_of_range` in history | `test_out_of_range...`, `test_no_alert_from...`, resilience check 4 |
+| A sensor drops out | the old value stays and looks current | removed: the item always equals the newest reading | `test_value_missing_in_the_newest_reading...` |
+| Pressure hovers around 28 psi | e-mail on every reading below 28 | one alert, a reminder every 15 min, back-to-normal only at 29 psi (hysteresis) | `test_recovery_needs_the_hysteresis_margin`, resilience check 6 |
+| Car stops sending (battery, no coverage) | nobody notices | offline after 10 min, one summary e-mail | `test_offline_vehicles_are_reported_once...` |
+| A downstream write fails | message lost (error log only) | retried (bisect, per record), then in the DLQ with an alarm; the stream keeps 24 h for replay | `test_failed_write_is_reported...`, `test_alert_is_retried_if_sns_fails` |
+
+## 6. Cost drivers (what grows with the fleet)
+
+| Component | Cost grows with | v4.1 | v5.0 |
+|---|---|---|---|
+| IoT Core | messages and rule actions | 3 rule actions per message | **1** per message; next: device-side batching and Basic Ingest |
+| Kinesis Data Streams | shard-hours (PROVISIONED) or data volume (ON_DEMAND) | - | new cost; small next to IoT Core at fleet scale |
+| Firehose | GB ingested, plus format conversion per GB | per GB | per GB + conversion; output much smaller |
+| Lambda | invocations x duration | one invocation per Firehose buffer | + state Lambda per batch of up to 100 (not per message) |
+| DynamoDB | writes | 1 write per message | 1 conditional write per message + 1 per alert; stale ones fail cheaply |
+| S3 | GB stored, requests | JSON + uncompressed raw | Parquet + GZIP raw, IA after 30 days |
+| Athena | bytes scanned (US$5 per TB, list price) | every column of JSON | only the needed columns of Parquet |
+| SNS e-mail | e-mails | one per low reading | one per alert episode + reminders |
+
+Prices differ by region; check the AWS pricing pages for ap-south-1 before quoting a monthly figure. The structural point holds everywhere: v5.0 removes per-message multipliers (3 rule actions, 1 e-mail per reading) and shrinks the bytes Athena reads.
+
+## 7. Five-minute explanation for a review
+
+1. **Where v4.1 breaks:** in Mumbai, Firehose Direct PUT takes 1,000 requests/s per stream, and v4.1 makes one request per message, so the history path stops at about 1,000 cars at 1 Hz. Three rules triple the IoT rule budget. Alerts become an e-mail storm. Late readings move the latest state backwards.
+2. **The one structural change:** a Kinesis Data Stream between IoT Core and everything else. It buffers (24 h replay), keeps each car's readings in order (partition key = vehicle ID) and feeds two independent consumers. It scales by shards (1,000 records/s each) or automatically in ON_DEMAND mode.
+3. **The two consumers:** Firehose writes Parquet for Athena (cheaper, faster scans); the state Lambda keeps the newest valid reading per car and decides alerts with cool-down and hysteresis.
+4. **Real-world data:** duplicates, late data, wrong clocks, impossible values, dropouts and silent cars are each handled, and each has a test (section 5).
+5. **Operations:** failures retry, then go to a dead-letter queue; 12 alarms cover throttling, lag, conversion and errors.
+6. **Proof:** 108 unit tests, cfn-lint, `load_test.py` (throughput and p50/p95 latency) and `resilience_test.py` on the live stack.
+7. **Still open, and why:** multi-account CD, organisation security services, real hardware, a 10,000-car test and a UI (section 9). These need an organisation, not more code.
+
+## 8. Is v5.0 production grade?
+
+**The architecture and the data path, yes:** it follows the AWS pattern for IoT telemetry (IoT Core -> Kinesis -> Firehose/Lambda -> S3/DynamoDB), handles the failure modes real devices create, has no path that loses a message without an alarm, and is tested. **The system as a whole, not yet:** a roll-out also needs the items in section 9, most of which are organisational (accounts, security services, on-call, privacy review) or need hardware and budget. The accurate statement for a review: *"production-grade architecture and data handling, verified with load and resilience tests in one account; environments, organisation security and hardware integration are the next phase."*
+
+## 9. What v5.0 still does not do
 * **Multi-region / disaster recovery**: one region. Production: a second region with IoT Core custom domain fail-over, or at least cross-region replication of S3 and DynamoDB global tables.
-* **Per-vehicle offline detection**, SLOs and an on-call rota.
+* SLOs and an on-call rota (offline detection is built).
 * **Compaction / Iceberg** for very large tables; **Glue Schema Registry** for versioned contracts.
 * **CD pipeline** (GitHub Actions with OIDC, dev and prod stacks). CI runs tests and cfn-lint.
 * **Customer-managed KMS keys**, CloudTrail, GuardDuty, IoT Device Defender, certificate rotation.
 * **Hardware and fleet-scale tests**: `load_test.py` runs hundreds of cars from one CloudShell; a 10,000-car test needs several load generators and quota increases.
 
-## 5. How to verify the numbers
+## 10. How to verify the numbers
 1. `python3 load_test.py --vehicles 100 --seconds 60`: messages/s, publish latency, end-to-end p50/p95 to DynamoDB.
-2. CloudWatch dashboard `vehicle-telemetry`: Kinesis `IncomingRecords` and `WriteProvisionedThroughputExceeded`, state lag, Firehose freshness.
-3. Athena: run the same report on the v5.0 Parquet table and note **Data scanned**; compare with a JSON table if you keep one from v4.1.
-4. `aws s3 ls s3://$BUCKET/telemetry/ --recursive --summarize`: file count and average size.
+2. `python3 resilience_test.py --athena`: the correctness checks of section 5 on the live stack.
+3. CloudWatch dashboard `vehicle-telemetry`: Kinesis `IncomingRecords` and `WriteProvisionedThroughputExceeded`, state lag, Firehose freshness.
+4. Athena: run the same report on the v5.0 Parquet table and note **Data scanned**; compare with a JSON table if you keep one from v4.1.
+5. `aws s3 ls s3://$BUCKET/telemetry/ --recursive --summarize`: file count and average size.
 
 ## References
 * AWS IoT Core quotas: https://docs.aws.amazon.com/general/latest/gr/iot-core.html
@@ -104,3 +166,5 @@ The trade-off is deliberate: real-time needs use DynamoDB; Athena is for reports
 * Firehose record format conversion to Parquet: https://docs.aws.amazon.com/firehose/latest/dev/record-format-conversion.html
 * Amazon SNS quotas: https://docs.aws.amazon.com/general/latest/gr/sns.html
 * Athena pricing and columnar formats: https://aws.amazon.com/athena/pricing/ and https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html
+* AWS IoT rule actions (Kinesis, Kafka with VPC destination): https://docs.aws.amazon.com/iot/latest/developerguide/iot-rule-actions.html
+* Amazon MSK: https://docs.aws.amazon.com/msk/latest/developerguide/what-is-msk.html

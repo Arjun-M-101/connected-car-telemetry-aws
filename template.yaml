@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Connected-car telemetry v5.0 (production) - IoT Core -> Kinesis Data Stream -> (Firehose + validation Lambda -> Parquet in S3 -> Glue/Athena) and (state Lambda -> DynamoDB latest state + de-duplicated SNS alerts), DLQ, CloudWatch alarms, per-device X.509 policy
+Description: Connected-car telemetry v5.0 (production) - IoT Core -> Kinesis Data Stream -> (Firehose + validation Lambda -> Parquet in S3 -> Glue/Athena) and (state Lambda -> DynamoDB latest state + alerts with hysteresis), offline detection, DLQ, CloudWatch alarms, per-device X.509 policy
 
 Parameters:
   AlertEmail:
@@ -35,6 +35,11 @@ Parameters:
     Default: 900
     MinValue: 60
     Description: After a low-tyre e-mail for a vehicle, further e-mails for the same vehicle are suppressed for this long
+  OfflineAfterMinutes:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    Description: A vehicle with no reading for this long is reported offline (one summary e-mail per check)
   StateBatchSize:
     Type: Number
     Default: 100
@@ -156,8 +161,8 @@ Resources:
       Code:
         ZipFile: |
           import base64, json, math
+          from datetime import datetime
 
-          # field -> (min, max) physical plausibility range
           FLOATS = {
               "tyre_fl_psi": (0, 100), "tyre_fr_psi": (0, 100),
               "tyre_rl_psi": (0, 100), "tyre_rr_psi": (0, 100),
@@ -166,6 +171,18 @@ Resources:
               "fuel_efficiency_kmpl": (0, 100),
           }
           HELPERS = ("topic_vehicle_id",)
+          MAX_FUTURE_MS = 300000
+
+
+          def to_ms(t):
+              """ISO-8601 with a time zone (Z or +hh:mm) -> epoch ms, else None."""
+              if not isinstance(t, str):
+                  return None
+              try:
+                  dt = datetime.fromisoformat(t.strip().replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              return int(dt.timestamp() * 1000) if dt.tzinfo else None
 
 
           def normalize(raw):
@@ -174,7 +191,7 @@ Resources:
                   raise ValueError("payload is not a JSON object")
               issues = []
               vid = raw.get("vehicle_id")
-              topic_id = raw.get("topic_vehicle_id")  # taken from the authenticated MQTT topic
+              topic_id = raw.get("topic_vehicle_id")
               if topic_id:
                   if vid and vid != topic_id:
                       issues.append("vehicle_id_mismatch")
@@ -186,6 +203,13 @@ Resources:
                      "schema_version": str(raw.get("schema_version", "1"))}
               if out["event_time"] is None:
                   issues.append("missing_event_time")
+              else:
+                  ems = to_ms(out["event_time"])
+                  ing = out["ingest_ts"] if isinstance(out["ingest_ts"], (int, float)) else None
+                  if ems is None:
+                      issues.append("bad_event_time")
+                  elif ing is not None and ems > ing + MAX_FUTURE_MS:
+                      issues.append("future_event_time")
               for f, (lo, hi) in FLOATS.items():
                   v = raw.get(f)
                   if v is None:
@@ -220,13 +244,11 @@ Resources:
                       data = base64.b64encode((json.dumps(out, separators=(",", ":")) + "\n").encode()).decode()
                       records.append({"recordId": r["recordId"], "result": "Ok", "data": data})
                   except Exception:
-                      # unparseable or no vehicle_id: Firehose writes the ORIGINAL to errors/processing-failed
                       records.append({"recordId": r["recordId"], "result": "ProcessingFailed", "data": r["data"]})
               return {"records": records}
 
   # ---------------------------------------------------------------- ingestion buffer (v5.0)
   # One durable, ordered stream between IoT Core and every consumer: 24 h replay, per-vehicle ordering
-  # (partition key = vehicle id), back-pressure instead of lost messages, and fan-out to two consumers.
   TelemetryStream:
     Type: AWS::Kinesis::Stream
     Properties:
@@ -419,7 +441,7 @@ Resources:
     DependsOn: StateLogGroup
     Properties:
       FunctionName: vehicle-telemetry-state
-      Description: Latest state per vehicle (newest event wins) and de-duplicated low-tyre alerts
+      Description: Latest state per vehicle (newest valid event wins) and low-tyre alerts with hysteresis, reminders and recovery
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt StateRole.Arn
@@ -431,100 +453,160 @@ Resources:
           TOPIC: !Ref AlertTopic
           LOW_PSI: !Ref LowTyrePsi
           COOLDOWN: !Ref AlertCooldownSeconds
+          REARM_MARGIN_PSI: "1.0"
+          MAX_FUTURE_SKEW_S: "300"
       Code:
         ZipFile: |
           import base64, json, os, time
+          from datetime import datetime
           import boto3
           from botocore.exceptions import ClientError
 
           ddb, sns = boto3.client("dynamodb"), boto3.client("sns")
           TABLE, TOPIC = os.environ["TABLE"], os.environ["TOPIC"]
-          LOW, COOL = float(os.environ["LOW_PSI"]), int(os.environ["COOLDOWN"])
+          LOW = float(os.environ["LOW_PSI"])
+          REARM = LOW + float(os.environ.get("REARM_MARGIN_PSI", "1.0"))
+          COOL = int(os.environ["COOLDOWN"])
+          MAX_FUTURE_MS = int(os.environ.get("MAX_FUTURE_SKEW_S", "300")) * 1000
+          RANGES = {"tyre_fl_psi": (0, 100), "tyre_fr_psi": (0, 100), "tyre_rl_psi": (0, 100), "tyre_rr_psi": (0, 100),
+                    "accelerator_pct": (0, 100), "clutch_pct": (0, 100), "speed_kmph": (0, 400),
+                    "fuel_level_pct": (0, 100), "fuel_efficiency_kmpl": (0, 100)}
           TYRES = ("tyre_fl_psi", "tyre_fr_psi", "tyre_rl_psi", "tyre_rr_psi")
-          FIELDS = TYRES + ("accelerator_pct", "clutch_pct", "speed_kmph", "fuel_level_pct", "fuel_efficiency_kmpl")
           CCF = "ConditionalCheckFailedException"
+          KEY = lambda vid: {"vehicle_id": {"S": vid}}
 
-          def num(v):
+          def num(v, lo, hi):
+              if isinstance(v, bool):
+                  return None
               try:
-                  x = None if isinstance(v, bool) else float(v)
+                  x = float(v)
               except (TypeError, ValueError):
                   return None
-              return x if x is not None and abs(x) < 1e12 else None
+              return x if lo <= x <= hi else None
 
-          def parse(data):
-              # vehicle id from the authenticated MQTT topic
+          def to_ms(t):
+              if not isinstance(t, str):
+                  return None
+              try:
+                  dt = datetime.fromisoformat(t.strip().replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+              return int(dt.timestamp() * 1000) if dt.tzinfo else None
+
+          def parse(data, now_ms):
               try:
                   m = json.loads(base64.b64decode(data))
               except ValueError:
-                  return None
-              m = m if isinstance(m, dict) else {}
-              vid, t = m.get("topic_vehicle_id") or m.get("vehicle_id"), m.get("event_time")
-              return (vid, t, m) if isinstance(vid, str) and isinstance(t, str) else None
+                  return None, "Skipped"
+              if not isinstance(m, dict):
+                  return None, "Skipped"
+              vid = m.get("topic_vehicle_id") or m.get("vehicle_id")
+              if not isinstance(vid, str) or not vid:
+                  return None, "Skipped"
+              ems = to_ms(m.get("event_time"))
+              if ems is None:
+                  return None, "BadTime"
+              ing = m.get("ingest_ts")
+              ing = int(ing) if isinstance(ing, (int, float)) and not isinstance(ing, bool) else now_ms
+              if ems > ing + MAX_FUTURE_MS:
+                  return None, "FutureSkew"
+              vals = {f: num(m.get(f), lo, hi) for f, (lo, hi) in RANGES.items()}
+              return {"vid": vid, "t": m["event_time"], "ems": ems, "ing": ing, "vals": vals}, None
 
-          def save_state(vid, t, m):
-              # newest wins; an older (late/replayed) reading never overwrites a newer one
-              sets, vals = ["#t = :t", "ingest_ts = :i"], {":t": {"S": t}}
-              vals[":i"] = {"N": str(int(num(m.get("ingest_ts")) or time.time() * 1000))}
-              for f in FIELDS:
-                  x = num(m.get(f))
-                  if x is not None:
+          def save_state(r):
+              sets, rem = ["event_time = :t", "event_ms = :e", "ingest_ts = :i"], ["offline_since"]
+              vals = {":t": {"S": r["t"]}, ":e": {"N": str(r["ems"])}, ":i": {"N": str(r["ing"])}}
+              for f, x in r["vals"].items():
+                  if x is None:
+                      rem.append(f)
+                  else:
                       sets.append(f"{f} = :{f}")
                       vals[":" + f] = {"N": repr(x)}
               try:
-                  ddb.update_item(TableName=TABLE, Key={"vehicle_id": {"S": vid}}, UpdateExpression="SET " + ", ".join(sets),
-                      ConditionExpression="attribute_not_exists(#t) OR #t <= :t",
-                      ExpressionAttributeNames={"#t": "event_time"}, ExpressionAttributeValues=vals)
+                  ddb.update_item(TableName=TABLE, Key=KEY(r["vid"]),
+                                  UpdateExpression="SET " + ", ".join(sets) + " REMOVE " + ", ".join(rem),
+                                  ConditionExpression="attribute_not_exists(event_ms) OR event_ms <= :e",
+                                  ExpressionAttributeValues=vals)
                   return True
               except ClientError as e:
                   if e.response["Error"]["Code"] == CCF:
                       return False
                   raise
 
-          def alert(vid, t, m, now):
-              # one e-mail per vehicle per cool-down, not one per message
-              low = {f: num(m.get(f)) for f in TYRES}
-              low = {f: v for f, v in low.items() if v is not None and v < LOW}
-              if not low:
-                  return None
-              try:
-                  ddb.update_item(TableName=TABLE, Key={"vehicle_id": {"S": vid}}, UpdateExpression="SET alert_until = :u",
-                      ConditionExpression="attribute_not_exists(alert_until) OR alert_until < :n",
-                      ExpressionAttributeValues={":u": {"N": str(now + COOL)}, ":n": {"N": str(now)}})
-              except ClientError as e:
-                  if e.response["Error"]["Code"] == CCF:
-                      return "suppressed"
-                  raise
-              try:
-                  sns.publish(TopicArn=TOPIC, Subject=f"Low tyre pressure: {vid}", Message=json.dumps(
-                      {"vehicle_id": vid, "event_time": t, "low_tyres_psi": low, "threshold_psi": LOW}))
-              except Exception:
-                  ddb.update_item(TableName=TABLE, Key={"vehicle_id": {"S": vid}}, UpdateExpression="REMOVE alert_until")
-                  raise
-              return "sent"
+          def publish(vid, kind, subject, body):
+              sns.publish(TopicArn=TOPIC, Subject=subject[:100], Message=json.dumps(body),
+                          MessageAttributes={"vehicle_id": {"DataType": "String", "StringValue": vid},
+                                             "alert_type": {"DataType": "String", "StringValue": kind}})
+
+          def alert(r, now):
+              vid, tyres = r["vid"], {f: r["vals"][f] for f in TYRES}
+              low = {f: v for f, v in tyres.items() if v is not None and v < LOW}
+              if low:
+                  try:
+                      old = ddb.update_item(TableName=TABLE, Key=KEY(vid), ReturnValues="UPDATED_OLD",
+                                            UpdateExpression="SET alert_active = :y, alert_until = :u",
+                                            ConditionExpression="attribute_not_exists(alert_until) OR alert_until < :n",
+                                            ExpressionAttributeValues={":y": {"BOOL": True}, ":u": {"N": str(now + COOL)},
+                                                                       ":n": {"N": str(now)}}).get("Attributes", {})
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] == CCF:
+                          return "AlertsSuppressed"
+                      raise
+                  first = "alert_active" not in old
+                  try:
+                      publish(vid, "low_tyre", ("Low tyre pressure: " if first else "Still low tyre pressure: ") + vid,
+                              {"vehicle_id": vid, "event_time": r["t"], "low_tyres_psi": low, "threshold_psi": LOW,
+                               "first_alert": first, "next_reminder_after_s": COOL})
+                  except Exception:
+                      ddb.update_item(TableName=TABLE, Key=KEY(vid),
+                                      UpdateExpression="REMOVE alert_until" + (", alert_active" if first else ""))
+                      raise
+                  return "AlertsSent"
+              if all(v is not None and v >= REARM for v in tyres.values()):
+                  try:
+                      ddb.update_item(TableName=TABLE, Key=KEY(vid), UpdateExpression="REMOVE alert_active, alert_until",
+                                      ConditionExpression="alert_active = :y", ExpressionAttributeValues={":y": {"BOOL": True}})
+                  except ClientError as e:
+                      if e.response["Error"]["Code"] == CCF:
+                          return None
+                      raise
+                  try:
+                      publish(vid, "recovered", "Tyre pressure back to normal: " + vid,
+                              {"vehicle_id": vid, "event_time": r["t"], "tyres_psi": tyres, "rearm_psi": REARM})
+                  except Exception:
+                      ddb.update_item(TableName=TABLE, Key=KEY(vid), UpdateExpression="SET alert_active = :y",
+                                      ExpressionAttributeValues={":y": {"BOOL": True}})
+                      raise
+                  return "Recovered"
+              return None
+
+          NAMES = ("Records", "Updated", "Stale", "Skipped", "BadTime", "FutureSkew",
+                   "AlertsSent", "AlertsSuppressed", "Recovered", "Failed")
 
           def handler(event, context):
-              now, c, failed = int(time.time()), dict.fromkeys(("Records", "Updated", "Stale", "Skipped", "AlertsSent",
-                                                     "AlertsSuppressed", "Failed"), 0), []
-              for r in event["Records"]:
+              now = int(time.time())
+              c, failed = dict.fromkeys(NAMES, 0), []
+              for rec in event["Records"]:
                   c["Records"] += 1
-                  p = parse(r["kinesis"]["data"])
-                  if p is None:
-                      c["Skipped"] += 1
+                  r, why = parse(rec["kinesis"]["data"], now * 1000)
+                  if r is None:
+                      c[why] += 1
                       continue
                   try:
-                      if save_state(*p):
+                      if save_state(r):
                           c["Updated"] += 1
-                          a = alert(*p, now)
+                          a = alert(r, now)
                           if a:
-                              c["AlertsSent" if a == "sent" else "AlertsSuppressed"] += 1
+                              c[a] += 1
                       else:
                           c["Stale"] += 1
                   except Exception as e:
-                      print("FAILED", p[0], repr(e))
+                      print(json.dumps({"level": "ERROR", "vehicle_id": r["vid"], "error": repr(e)[:300]}))
                       c["Failed"] += 1
-                      failed.append({"itemIdentifier": r["kinesis"]["sequenceNumber"]})
-              print(json.dumps({"_aws": {"Timestamp": now * 1000, "CloudWatchMetrics": [{"Namespace": "VehicleTelemetry",
-                    "Dimensions": [["Stage"]], "Metrics": [{"Name": k, "Unit": "Count"} for k in c]}]}, "Stage": "state", **c}))
+                      failed.append({"itemIdentifier": rec["kinesis"]["sequenceNumber"]})
+              print(json.dumps({"_aws": {"Timestamp": now * 1000, "CloudWatchMetrics": [{
+                  "Namespace": "VehicleTelemetry", "Dimensions": [["Stage"]],
+                  "Metrics": [{"Name": k, "Unit": "Count"} for k in NAMES]}]}, "Stage": "state", **c}))
               return {"batchItemFailures": failed}
 
   StateEventSource:
@@ -536,8 +618,6 @@ Resources:
       BatchSize: !Ref StateBatchSize
       MaximumBatchingWindowInSeconds: 1
       # Up to 10 batches per shard run at once; readings of one vehicle (same partition key) still stay in order.
-      # One UpdateItem takes ~5-10 ms, so 1 batch at a time would cap a shard at ~100-200 records/s, below
-      # the 1,000 records/s a shard accepts. 10 lets the consumer keep up with a full shard.
       ParallelizationFactor: 10
       BisectBatchOnFunctionError: true
       MaximumRetryAttempts: 3
@@ -546,6 +626,118 @@ Resources:
       DestinationConfig:
         OnFailure:
           Destination: !GetAtt StateDLQ.Arn
+
+  # ---------------------------------------------------------------- per-vehicle offline detection
+  OfflineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/vehicle-telemetry-offline-check
+      RetentionInDays: 30
+
+  OfflineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: offline-check
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:UpdateItem]
+                Resource: !GetAtt LatestStateTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt OfflineLogGroup.Arn
+
+  OfflineFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OfflineLogGroup
+    Properties:
+      FunctionName: vehicle-telemetry-offline-check
+      Description: Every 5 minutes, reports vehicles with no reading for OfflineAfterMinutes (once per vehicle)
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt OfflineRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE: !Ref LatestStateTable
+          TOPIC: !Ref AlertTopic
+          OFFLINE_AFTER_MIN: !Ref OfflineAfterMinutes
+      Code:
+        ZipFile: |
+          import json, os, time
+          import boto3
+          from botocore.exceptions import ClientError
+
+          ddb, sns = boto3.client("dynamodb"), boto3.client("sns")
+          TABLE, TOPIC = os.environ["TABLE"], os.environ["TOPIC"]
+          AFTER_MS = int(os.environ["OFFLINE_AFTER_MIN"]) * 60 * 1000
+
+          def handler(event, context):
+              now = int(time.time() * 1000)
+              cutoff, seen, offline, newly = now - AFTER_MS, 0, 0, []
+              kw = {"TableName": TABLE, "ProjectionExpression": "vehicle_id, ingest_ts, offline_since"}
+              while True:
+                  page = ddb.scan(**kw)
+                  for it in page.get("Items", []):
+                      seen += 1
+                      last = int(float(it.get("ingest_ts", {}).get("N", "0")))
+                      if last >= cutoff:
+                          continue
+                      offline += 1
+                      if "offline_since" in it:
+                          continue
+                      vid = it["vehicle_id"]["S"]
+                      try:
+                          ddb.update_item(TableName=TABLE, Key={"vehicle_id": {"S": vid}},
+                                          UpdateExpression="SET offline_since = :n",
+                                          ConditionExpression="attribute_not_exists(offline_since) AND ingest_ts < :c",
+                                          ExpressionAttributeValues={":n": {"N": str(now)}, ":c": {"N": str(cutoff)}})
+                          newly.append({"vehicle_id": vid, "last_seen_min_ago": round((now - last) / 60000, 1)})
+                      except ClientError as e:
+                          if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                              raise
+                  if "LastEvaluatedKey" not in page:
+                      break
+                  kw["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+              if newly:
+                  sns.publish(TopicArn=TOPIC, Subject=f"{len(newly)} vehicle(s) went offline",
+                              Message=json.dumps({"offline_after_min": AFTER_MS // 60000, "count": len(newly),
+                                                  "vehicles": newly[:50], "more": max(0, len(newly) - 50)}),
+                              MessageAttributes={"alert_type": {"DataType": "String", "StringValue": "offline"}})
+              print(json.dumps({"_aws": {"Timestamp": now, "CloudWatchMetrics": [{
+                  "Namespace": "VehicleTelemetry", "Dimensions": [["Stage"]],
+                  "Metrics": [{"Name": k, "Unit": "Count"} for k in ("VehiclesSeen", "VehiclesOffline", "NewlyOffline")]}]},
+                  "Stage": "offline-check", "VehiclesSeen": seen, "VehiclesOffline": offline, "NewlyOffline": len(newly)}))
+              return {"seen": seen, "offline": offline, "newly_offline": len(newly)}
+
+  OfflineSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: vehicle-telemetry-offline-check
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - { Id: offline-check, Arn: !GetAtt OfflineFunction.Arn }
+
+  OfflinePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OfflineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OfflineSchedule.Arn
 
   # ---------------------------------------------------------------- IoT rule (one rule, one action)
   IotRuleRole:
@@ -575,7 +767,6 @@ Resources:
       RuleName: vehicle_telemetry_ingest
       TopicRulePayload:
         # vehicle id comes from the authenticated MQTT topic (topic(2)); it is also the partition key,
-        # so all readings of one vehicle stay in order on one shard.
         Sql: "SELECT *, topic(2) AS topic_vehicle_id, timestamp() AS ingest_ts FROM 'vehicles/+/telemetry'"
         AwsIotSqlVersion: "2016-03-23"
         RuleDisabled: false
@@ -644,7 +835,6 @@ Resources:
         StorageDescriptor:
           Location: !Sub "s3://${DataBucket}/telemetry/"
           # v5.0: Parquet (columnar, Snappy) written by Firehose. Athena reads only the columns a query
-          # needs, so scans are several times smaller and faster than with JSON text.
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
           SerdeInfo:
@@ -764,6 +954,38 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref OpsTopic]
 
+  ConversionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: vehicle-telemetry-parquet-conversion-failed
+      AlarmDescription: Firehose could not convert records to Parquet (they are in errors/format-conversion-failed/)
+      Namespace: AWS/Firehose
+      MetricName: FailedConversion.Records
+      Dimensions: [{ Name: DeliveryStreamName, Value: !Ref DeliveryStream }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  OfflineCheckErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: vehicle-telemetry-offline-check-errors
+      AlarmDescription: The offline-detection Lambda failed
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref OfflineFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
   TransformErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -855,10 +1077,11 @@ Resources:
          {"type":"metric","x":16,"y":0,"width":8,"height":6,"properties":{"title":"Latest-state lag (ms, iterator age)","region":"${AWS::Region}","stat":"Maximum","period":60,"metrics":[["AWS/Lambda","IteratorAge","FunctionName","${StateFunction}"]]}},
          {"type":"metric","x":0,"y":6,"width":8,"height":6,"properties":{"title":"Firehose records and delivery","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/Firehose","IncomingRecords","DeliveryStreamName","${DeliveryStream}"],["AWS/Firehose","DeliveryToS3.Records","DeliveryStreamName","${DeliveryStream}"]]}},
          {"type":"metric","x":8,"y":6,"width":8,"height":6,"properties":{"title":"History freshness (seconds)","region":"${AWS::Region}","stat":"Maximum","period":60,"metrics":[["AWS/Firehose","DeliveryToS3.DataFreshness","DeliveryStreamName","${DeliveryStream}"]]}},
-         {"type":"metric","x":16,"y":6,"width":8,"height":6,"properties":{"title":"State Lambda: updated / stale / alerts","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["VehicleTelemetry","Updated","Stage","state"],["VehicleTelemetry","Stale","Stage","state"],["VehicleTelemetry","AlertsSent","Stage","state"],["VehicleTelemetry","AlertsSuppressed","Stage","state"],["VehicleTelemetry","Failed","Stage","state"]]}},
+         {"type":"metric","x":16,"y":6,"width":8,"height":6,"properties":{"title":"State Lambda: updated / stale / alerts","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["VehicleTelemetry","Updated","Stage","state"],["VehicleTelemetry","Stale","Stage","state"],["VehicleTelemetry","AlertsSent","Stage","state"],["VehicleTelemetry","AlertsSuppressed","Stage","state"],["VehicleTelemetry","Recovered","Stage","state"],["VehicleTelemetry","FutureSkew","Stage","state"],["VehicleTelemetry","BadTime","Stage","state"],["VehicleTelemetry","Failed","Stage","state"]]}},
          {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Lambdas: invocations / errors","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/Lambda","Invocations","FunctionName","${TransformFunction}"],["AWS/Lambda","Errors","FunctionName","${TransformFunction}"],["AWS/Lambda","Invocations","FunctionName","${StateFunction}"],["AWS/Lambda","Errors","FunctionName","${StateFunction}"]]}},
-         {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Alert emails (SNS)","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/SNS","NumberOfMessagesPublished","TopicName","${AlertTopic.TopicName}"],["AWS/SNS","NumberOfNotificationsFailed","TopicName","${AlertTopic.TopicName}"]]}},
-         {"type":"alarm","x":0,"y":18,"width":24,"height":4,"properties":{"title":"Alarm status","alarms":["${RuleFailureAlarm.Arn}","${StreamThrottleAlarm.Arn}","${FirehoseDeliveryAlarm.Arn}","${FirehoseFreshnessAlarm.Arn}","${TransformErrorAlarm.Arn}","${StateErrorAlarm.Arn}","${StateLagAlarm.Arn}","${DeadLetterAlarm.Arn}","${AlertDeliveryAlarm.Arn}"]}}
+         {"type":"metric","x":12,"y":12,"width":6,"height":6,"properties":{"title":"Vehicles offline","region":"${AWS::Region}","stat":"Maximum","period":300,"metrics":[["VehicleTelemetry","VehiclesOffline","Stage","offline-check"],["VehicleTelemetry","VehiclesSeen","Stage","offline-check"]]}},
+         {"type":"metric","x":18,"y":12,"width":6,"height":6,"properties":{"title":"Alert emails (SNS)","region":"${AWS::Region}","stat":"Sum","period":60,"metrics":[["AWS/SNS","NumberOfMessagesPublished","TopicName","${AlertTopic.TopicName}"],["AWS/SNS","NumberOfNotificationsFailed","TopicName","${AlertTopic.TopicName}"]]}},
+         {"type":"alarm","x":0,"y":18,"width":24,"height":4,"properties":{"title":"Alarm status","alarms":["${RuleFailureAlarm.Arn}","${StreamThrottleAlarm.Arn}","${FirehoseDeliveryAlarm.Arn}","${FirehoseFreshnessAlarm.Arn}","${TransformErrorAlarm.Arn}","${StateErrorAlarm.Arn}","${StateLagAlarm.Arn}","${DeadLetterAlarm.Arn}","${ConversionFailureAlarm.Arn}","${OfflineCheckErrorAlarm.Arn}","${AlertDeliveryAlarm.Arn}"]}}
         ]}
 
 Outputs:

@@ -325,6 +325,7 @@ verify() {
   check "DynamoDB table" "$(aws dynamodb list-tables --output text --query "TableNames[?starts_with(@, 'vehicle-')]" 2>/dev/null | lines)"
   check "Lambda function" "$(aws lambda list-functions --output text --query "Functions[?starts_with(FunctionName, '$STACK')].FunctionName" 2>/dev/null | lines)"
   check "Kinesis data stream" "$(aws kinesis list-streams --output text --query "StreamNames[?starts_with(@, '$STACK')]" 2>/dev/null | lines)"
+  check "EventBridge schedule" "$(aws events list-rules --name-prefix "$STACK" --output text --query "Rules[].Name" 2>/dev/null | lines)"
   check "SQS dead-letter queue" "$(aws sqs list-queues --queue-name-prefix "$STACK" --output text --query "QueueUrls[]" 2>/dev/null | grep -v '^None$' | lines)"
   check "Firehose delivery stream" "$(aws firehose list-delivery-streams --limit 10000 --output text --query "DeliveryStreamNames[?starts_with(@, '$STACK')]" 2>/dev/null | lines)"
   check "SNS topics" "$(aws sns list-topics --output text --query "Topics[?contains(TopicArn, ':$STACK-')].TopicArn" 2>/dev/null | lines)"

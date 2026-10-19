@@ -1,24 +1,27 @@
-# From proof of concept to production: gap analysis and roadmap
+# From proof of concept to production: status, gaps and roadmap (v5.0)
 
-> **v5.0 update (19 Oct 2026):** the ingestion, real-time and alert items marked *v5.0* below are now built: Kinesis Data Stream in front, Parquet history, newest-wins latest state, de-duplicated alerts, retries with a dead-letter queue, 10 alarms and a load test. Analysis and numbers: [PERFORMANCE_SCALABILITY.md](PERFORMANCE_SCALABILITY.md).
+**Status (19 Oct 2026, project v5.0):** the data path is built to a production architecture: one IoT rule into an encrypted **Amazon Kinesis Data Stream**, Firehose to **Parquet**, a state Lambda that keeps the newest valid reading per car and sends alerts with hysteresis, offline detection, retries with a dead-letter queue and 12 alarms. What is **not** production yet is mostly outside the code: a second environment and a deployment pipeline, organisation-level security services, real hardware and a fleet-scale test, and a user interface. Each gap is listed below with the reason it is not built here.
 
-This project is a **working proof of concept with production-minded foundations**, not a finished production system.
-It proves the data path, alerting, validation, and the chatbot idea. This document lists exactly what is done, what is designed but not built, and what a real roll-out needs.
+The performance and scalability comparison of v4.1 and v5.0, with numbers, is in [PERFORMANCE_SCALABILITY.md](PERFORMANCE_SCALABILITY.md).
 
 ## 1. Status at a glance
-| Area | In the project now (v4) | Not yet (needed for production) |
-|---|---|---|
-| Ingestion | IoT Core MQTT -> **Kinesis Data Stream (v5.0)**, 24 h replay, per-vehicle ordering -> Firehose -> Parquet in S3 | MSK if the organisation standardises on Kafka; batching/compression on device; quota increases for >20k msg/s |
-| Schema / format change | Validation Lambda: typed known fields, unknown fields kept in `extras`, bad values flagged, raw copy kept, `schema_version` field | Schema registry and versioned contracts per device model; automated promotion of new fields into columns; Iceberg tables with schema evolution |
-| Real hardware | Device policy per vehicle, X.509 provisioning script, MQTT sender with store-and-forward outbox | Fleet provisioning at scale, OTA updates (IoT Jobs), tested on a real telematics unit / OBD-II dongle |
-| Infrastructure as code | CloudFormation (one template, validated by cfn-lint and 79 automated tests) | Environments (dev/test/prod), remote state not needed (CFN), or port to Terraform if the team standard requires it |
-| CI/CD | CI: pytest + cfn-lint on every push | CD: deploy via GitHub Actions with an AWS OIDC role, change sets reviewed, dev -> prod promotion |
-| Observability | Dashboard, 5 alarms plus an optional sixth, log groups with retention, IoT rule error logging, optional "fleet silent" alarm | Per-vehicle offline detection, SLOs and error budgets, tracing, on-call rota (PagerDuty/Opsgenie), runbooks per alarm |
-| Security | Least-privilege roles, per-device certificates and policy, TLS-only encrypted private bucket, topic-trusted identity, PITR on DynamoDB, secrets never in code | Customer-managed KMS keys, CloudTrail + GuardDuty + Security Hub + Config, VPC endpoints, IoT Device Defender, certificate rotation, data-privacy controls (location is personal data), pen test |
-| Alerts | Email via SNS for tyre pressure, **de-duplicated per car with a cool-down (v5.0)** | escalation, SMS/push to driver app, ticket creation for support, per-customer preferences |
-| User interface | CloudShell + Athena + chatbot CLI | QuickSight/Grafana dashboards, support-agent web app, driver mobile app, chatbot behind authenticated API |
-| Scale | **load_test.py (v5.0)**: N cars x 1 msg/s, throughput and end-to-end latency; sizing in PERFORMANCE_SCALABILITY.md | multi-generator test at 10k+ cars, compaction / Iceberg |
-| Data governance | Raw/clean separation, lifecycle expiry | Catalog ownership, retention policy per regulation, lineage, access control per team (Lake Formation) |
+| Area | Built in v5.0 | Still needed for a real roll-out | Why not built here |
+|---|---|---|---|
+| Ingestion | IoT Core MQTT/HTTPS, **1 rule -> Kinesis Data Stream** (KMS-encrypted, 24 h replay, ordered per vehicle, PROVISIONED or ON_DEMAND) | Device-side batching, IoT Basic Ingest, quota increases above 20,000 msg/s | needs real devices and a traffic forecast |
+| Why Kinesis, not MSK | Kinesis is serverless, has a direct IoT rule action, scales per shard, pay per hour | MSK only if the organisation already runs Kafka (Kafka Connect, MirrorMaker, existing consumers) | MSK needs a VPC, brokers or a Serverless cluster and costs far more for this volume (see PERFORMANCE_SCALABILITY.md, section 4) |
+| History | Firehose reads the stream, validation Lambda, **Parquet (Snappy)**, raw copy GZIP, partition projection | Apache Iceberg tables with compaction; a curated de-duplicated table | worthwhile at TB scale; the dedupe query covers reports now |
+| Real-time state | **Newest valid reading wins** (conditional write on event time in ms), impossible values never stored, future clocks rejected, idempotent retries | Global table in a second region | single-region project |
+| Alerts | **Per-vehicle cool-down, reminders, hysteresis, recovery message**, SNS message attributes for routing | SMS/push to a driver app, tickets for support, escalation, per-customer preferences | needs a driver app and a ticketing system |
+| Fleet health | **Offline detection** every 5 minutes, one summary e-mail, metric `VehiclesOffline` | IoT Fleet Indexing connectivity status for MQTT devices; GSI instead of a scan above ~100,000 vehicles | the scan is cheap and simple up to that size |
+| Schema / format change | Validation Lambda: typed known fields, unknown fields in `extras`, bad values and bad or future times flagged, raw copy kept, `schema_version` | Glue Schema Registry and versioned contracts per device model | needs several real device types |
+| Failure handling | Retries, batch bisection, per-record failure reporting, **SQS dead-letter queue**, 24 h stream replay | Replay runbook automation from the DLQ | the stream keeps 24 h, so a manual replay is possible |
+| Observability | Dashboard; **12 alarms** (11 + optional no-data): rule failures, stream throttling, consumer lag, DLQ, Parquet conversion, Lambda errors, freshness, delivery, alert delivery; custom metrics | SLOs and error budgets, on-call routing (PagerDuty/Opsgenie), runbook per alarm, tracing | needs an operations team |
+| Infrastructure as code | One CloudFormation template (45 resources), tested by 108 unit tests and cfn-lint, a reference-integrity test and a size test | Same template deployed to dev and prod **accounts** (AWS multi-account best practice; fixed names are safe per account) | one personal account |
+| CI/CD | CI: pytest, cfn-lint, shell syntax on every push | CD: GitHub Actions with an AWS OIDC role, change sets reviewed, dev -> prod promotion | needs a second account and approvals |
+| Security | Least-privilege roles per function, per-device certificate and policy, topic-trusted identity, TLS-only private bucket with versioning, encrypted stream, queue and table, PITR | Customer-managed KMS keys, CloudTrail + GuardDuty + Security Hub + Config, IoT Device Defender, certificate rotation, pen test, privacy impact assessment (DPDP Act / GDPR) | organisation-level services and reviews |
+| Performance proof | `load_test.py` (throughput, p50/p95 latency), `resilience_test.py` (late, duplicate, future clock, bad value, hysteresis) | 10,000+ vehicle test with several load generators | needs quota increases and budget |
+| User interface | CloudShell, Athena, dashboard, chatbot CLI | QuickSight/Grafana, support web app, driver app, chatbot behind an authenticated API | separate product work |
+| Data governance | Raw/clean separation, lifecycle, IA tiering, versioning | Catalog ownership, retention per regulation, lineage, Lake Formation | organisation policy |
 
 ## 2. Different fields or formats from real devices
 **Today the pipeline copes with: extra fields, missing fields, numbers sent as text, out-of-range or broken values, and a wrong vehicle id.** (README, Playbook step 5 tests each one.)
@@ -32,7 +35,7 @@ It proves the data path, alerting, validation, and the chatbot idea. This docume
 1. Contract per device model and firmware: `{device_type, schema_version}` in every message. (`schema_version` is already carried.)
 2. Raw layer immutable (done), curated layer typed (done), analytics layer (aggregates) built from curated.
 3. Schema registry (AWS Glue Schema Registry) and compatibility rules (add optional fields only).
-4. Dead-letter handling with alarms and a replay job that re-processes `raw/` after a fix.
+4. Dead-letter handling with alarms (built in v5.0 for the real-time path: SQS queue + alarm) and a replay job that re-processes `raw/` after a fix (not built).
 5. Different formats (binary CBOR/Protobuf, CAN bus signals) are decoded at the edge or in a decoding Lambda; the rest of the pipeline stays JSON.
 6. Units: always send SI/agreed units and a unit field if mixed (psi vs kPa vs bar is a classic bug).
 
@@ -49,45 +52,42 @@ It proves the data path, alerting, validation, and the chatbot idea. This docume
 **Real-world challenges and what handles them:**
 | Challenge | Why it happens | Mitigation |
 |---|---|---|
-| Connectivity gaps | tunnels, parking garages, roaming | store-and-forward outbox (built), QoS 1, persistent session, back-off |
-| Duplicates and out-of-order data | QoS 1 is at-least-once, buffered replays | `seq` + `event_time` + vehicle id for de-duplication; curated layer dedupe job |
-| Wrong clocks | device RTC drift | server `ingest_ts` added (built); compare with `event_time`; flag large skew |
+| Connectivity gaps | tunnels, parking garages, roaming | store-and-forward outbox (built), QoS 1, persistent session, back-off; offline detection after 10 minutes (built v5.0) |
+| Duplicates and out-of-order data | QoS 1 is at-least-once, buffered replays | latest state: newest `event_time` wins, idempotent (built v5.0); history keeps every copy, reports use `telemetry_dedup` (sql/queries.sql); a curated dedupe job for large tables is next |
+| Wrong clocks | device RTC drift | server `ingest_ts` (built); a reading more than 5 minutes ahead of AWS is flagged `future_event_time` and cannot change the latest state (built v5.0); time zones and formats parsed to epoch ms (built v5.0) |
 | Sensor noise and faults | stuck, spiking, disconnected sensors | range checks (built), plus stuck-value and rate-of-change rules |
 | Different devices and firmware | many suppliers, formats | schema_version, contracts, decoding layer |
-| Message volume and cost | 1 Hz x millions of vehicles | batch several readings per message, compress, sample, move to Kinesis/MSK + Flink |
+| Message volume and cost | 1 Hz x millions of vehicles | Kinesis Data Stream in front (built v5.0), Parquet (built v5.0); batch several readings per message on the device, IoT Basic Ingest, Managed Flink for windowed aggregates (next) |
 | Identity | stolen or cloned device | per-device certificate (built), policy limits topics (built), Device Defender, revoke certs |
 | Updates | bugs in firmware | IoT Jobs OTA with staged roll-out |
 | Privacy | GPS and driving behaviour are personal data | consent, minimisation, encryption, retention, access logging (India DPDP Act, GDPR for EU customers) |
-| Alert fatigue | flapping values near threshold | hysteresis, cool-down, per-vehicle de-duplication |
+| Alert fatigue | flapping values near threshold | per-vehicle cool-down, reminder, hysteresis band and a 'back to normal' message (built v5.0) |
 
-**Will it work on real live data?** The architecture is the standard AWS pattern for it and the protocol path is realistic, but it has not been run with physical hardware or at fleet scale. The accurate claim is "validated end to end with simulated sensors and real-device-style authentication; hardware and load tests are the next phase".
+**Will it work on real live data?** The architecture is the standard AWS pattern for it, and v5.0 handles the problems real devices cause (duplicates, late and out-of-order data, wrong clocks, impossible values, connection gaps, flapping values). It has not been run with physical hardware or at fleet scale. The accurate claim is "validated end to end with simulated sensors and real-device-style authentication, with a resilience test and a load test on the live stack; hardware and 10,000+ vehicle tests are the next phase".
 
-## 4. From proof of concept to production
-It is a prototype by scope, on purpose: prove the path first, then harden. It does use more than the minimum (IoT Core, Lambda, Firehose, S3, Glue, Athena, DynamoDB, SNS, CloudWatch, IAM, CloudFormation), but a production system also needs the items in the table in section 1.
-
-**Phased plan (realistic effort for one engineer, part time):**
-| Phase | Deliverable | Effort |
+## 4. Roadmap
+| Phase | Deliverable | Status |
 |---|---|---|
-| 1 (done) | Simulated end-to-end, alerts, DynamoDB, chatbot, tests | done |
-| 2 (v4 / v4.1, done) | Validation + schema flexibility, observability, security hardening, device identity, playbook; v4.1 fixes rule identity | done |
-| 3 | CD pipeline with OIDC, dev/prod stacks, change-set review | 2 to 3 days |
-| 4 | Real hardware proof (Pi/ESP32/OBD-II), decoding of real payloads | 1 to 2 weeks |
-| 5 | UI: QuickSight dashboard on Athena; support web app; chatbot behind an authenticated API (API Gateway + Lambda + Cognito) | 1 to 2 weeks |
-| 6 | Alert engine: de-dup, hysteresis, escalation, SMS/push, ticketing | 1 week |
-| 7 (v5.0, done) | Kinesis stream, Parquet, newest-wins state, alert de-duplication, DLQ, load test, scalability analysis | done |
-| 7b | Iceberg and compaction; 10k-car load test | 1 to 2 weeks |
-| 8 | Security review: KMS, CloudTrail, GuardDuty, Device Defender, pen test, privacy impact assessment | 1 to 2 weeks |
+| 1 | Simulated end-to-end, alerts, DynamoDB, chatbot, tests | done |
+| 2 (v4 / v4.1) | Validation and schema flexibility, observability, security hardening, device identity, playbook | done |
+| 2b (v4.1.1) | Re-runnable, verifying tear-down | done |
+| 3 (v5.0) | Kinesis Data Stream, Parquet, newest-valid-wins state, alert hysteresis, offline detection, DLQ, 12 alarms, load and resilience tests, scalability analysis | done |
+| 4 | CD pipeline with OIDC; dev and prod accounts | 2 to 3 days |
+| 5 | Real hardware proof (Raspberry Pi, ESP32 or OBD-II) | 1 to 2 weeks |
+| 6 | UI: dashboards on Athena; support web app; chatbot behind API Gateway + Cognito | 1 to 2 weeks |
+| 7 | Driver/support channels: SMS or push, tickets, escalation | 1 week |
+| 8 | 10,000+ vehicle test; Iceberg and compaction; Managed Flink aggregates if needed | 1 to 2 weeks |
+| 9 | Security review: KMS, CloudTrail, GuardDuty, Device Defender, pen test, privacy impact assessment | 1 to 2 weeks |
 
-**Terraform vs CloudFormation:** this project uses CloudFormation because it needs nothing installed in CloudShell. The lakehouse project uses Terraform; porting is mechanical (resources map one to one) and can be done if the team standard is Terraform.
+**Terraform vs CloudFormation:** CloudFormation needs nothing installed in CloudShell. Porting to Terraform is mechanical if the team standard requires it.
 
 ## 5. Observability model
-* **Metrics (what is happening):** messages in, rule success/failure, Firehose records and freshness, Lambda errors, alerts sent (dashboard `vehicle-telemetry`).
-* **Logs (why):** Lambda, Firehose delivery and IoT rule errors, 30-day retention.
-* **Alarms (who gets woken):** rule failures, delivery failure, stale data (>15 min), Lambda crash, alert delivery failure, fleet silent (optional) -> operations email topic.
-* **Known gaps:** no per-vehicle "offline" alarm (needs a scheduled check on DynamoDB `event_time` or IoT Fleet Indexing connectivity), no distributed tracing, no SLOs, no on-call routing, no data-quality trend alarm.
-* **Suggested SLOs:** 99% of readings queryable within 3 minutes (history path) and 5 seconds (latest state); alert email within 1 minute of a threshold breach.
+* **Metrics:** messages in, rule success/failure, Kinesis records and throttles, consumer lag (iterator age), Firehose records, freshness and Parquet conversion, Lambda errors, state counters (Updated, Stale, BadTime, FutureSkew, AlertsSent, AlertsSuppressed, Recovered, Failed), vehicles offline, alerts sent.
+* **Logs:** three Lambdas, Firehose delivery, IoT rule errors; 30-day retention.
+* **Alarms -> operations topic:** see the README table (12 with the optional no-data alarm).
+* **Suggested SLOs:** 99% of readings in the latest state within 5 s and queryable in Athena within the buffer interval + 3 minutes; first alert e-mail within 1 minute of the first low reading; offline reported within OfflineAfterMinutes + 5 minutes.
 
 ## 6. Security model
-Layers: identity (per-device certificate and policy, IAM roles scoped per service) -> data (TLS in transit, encryption at rest, public access blocked, TLS-only bucket policy, point-in-time recovery) -> detection (error logs, alarms) -> process (no secrets in code, `.gitignore` for certs and keys, CI checks).
-**Not done:** KMS customer keys, CloudTrail/GuardDuty/Security Hub/Config, IoT Device Defender, certificate rotation, network isolation (VPC endpoints), Cognito for user access, threat model review, privacy impact assessment.
+Layers: identity (per-device certificate and policy, one IAM role per function scoped to its resources) -> data (TLS in transit; encryption at rest in S3, Kinesis, SQS and DynamoDB; public access blocked; versioning; PITR) -> detection (error logs, alarms) -> process (no secrets in code, `.gitignore` for certs and keys, CI checks).
+**Not done:** customer-managed KMS keys, CloudTrail/GuardDuty/Security Hub/Config, IoT Device Defender, certificate rotation, VPC endpoints (no VPC resources are used), Cognito for user access, threat model, privacy impact assessment.
 **LLM data note:** the chatbot sends the question and a small result table to the LLM provider. With synthetic data that is fine; with real vehicle data it can be personal data and needs approval, a data-processing agreement, or an in-region model (Bedrock).
