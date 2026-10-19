@@ -10,7 +10,7 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 
 ![Architecture diagram v5.0](screenshots/AWS_Architecture_Diagram-Dark.png)
 
-*Architecture v5.0, drawn from `template.yaml` (light version: [AWS_Architecture_Diagram-Default.png](screenshots/AWS_Architecture_Diagram-Default.png)). The earlier v4.1 diagrams (three IoT rules) are kept as `AWS_Architecture_Diagram-Dark(old).png` and `AWS_Architecture_Diagram-Default(old).png`; they were generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if it differs. The design follows published patterns; see [section 12](#12-design-basis-history-and-references).*
+*Architecture v5.0 with official AWS icons (light version: [AWS_Architecture_Diagram-Default.png](screenshots/AWS_Architecture_Diagram-Default.png)). The same v5.0 design as a plain flowchart is kept as `AWS_Architecture_Diagram-Flowchart-Dark.png` and `AWS_Architecture_Diagram-Flowchart-Default.png`; the earlier v4.1 diagrams (three IoT rules) are kept as `AWS_Architecture_Diagram-Dark(old).png` and `AWS_Architecture_Diagram-Default(old).png`. The icon diagrams were generated with AI (ChatGPT) from a written description of the deployed design, then checked by the author against `template.yaml` and corrected where the picture was wrong. `template.yaml` is the source of truth if it differs. The design follows published patterns; see [section 12](#12-design-basis-history-and-references).*
 
 ## Contents
 1. [What it covers](#1-what-it-covers)
@@ -553,8 +553,10 @@ Evidence from real runs in my own AWS account (region ap-south-1). All data is s
 
 ```
 screenshots/
-├── AWS_Architecture_Diagram-Dark.png                          # architecture diagram v5.0, dark (drawn from template.yaml; shown at the top)
-├── AWS_Architecture_Diagram-Default.png                       # architecture diagram v5.0, light
+├── AWS_Architecture_Diagram-Dark.png                          # architecture diagram v5.0 with AWS icons, dark (shown at the top)
+├── AWS_Architecture_Diagram-Default.png                       # architecture diagram v5.0 with AWS icons, light
+├── AWS_Architecture_Diagram-Flowchart-Dark.png                # v5.0 flowchart, dark (drawn from template.yaml)
+├── AWS_Architecture_Diagram-Flowchart-Default.png             # v5.0 flowchart, light
 ├── AWS_Architecture_Diagram-Dark(old).png                     # v4.1 diagram, dark (AI-generated, author-checked; three IoT rules)
 ├── AWS_Architecture_Diagram-Default(old).png                  # v4.1 diagram, light
 ├── v5-pytest-and-deploy.png                                   # v5.0: tests (108 at commit b31e1f5; 109 after the last commit), cfn-lint, stack update
