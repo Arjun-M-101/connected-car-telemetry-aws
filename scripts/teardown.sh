@@ -169,7 +169,15 @@ remove_devices() {
 
 wait_for_firehose() {
   if [ -n "$(stack_resource DeliveryStream)" ]; then
-    say "  Waiting $FLUSH_WAIT s (Firehose buffers for up to 60 s)..."
+    # v5.0: the buffer interval is a stack parameter (60 s demo, up to 900 s production); wait at most 5 min,
+    # a later file is still handled by the DELETE_FAILED retry, which empties the bucket again.
+    local iv
+    iv=$(aws cloudformation describe-stacks --stack-name "$STACK" --output text \
+         --query "Stacks[0].Parameters[?ParameterKey=='BufferIntervalSeconds'].ParameterValue" 2>/dev/null | lines)
+    case "$iv" in ''|*[!0-9]*) iv=60 ;; esac
+    [ "$iv" -gt 300 ] && iv=300
+    [ $((iv + 15)) -gt "$FLUSH_WAIT" ] && FLUSH_WAIT=$((iv + 15))
+    say "  Waiting $FLUSH_WAIT s (Firehose writes its buffer every ${iv} s)..."
     sleep "$FLUSH_WAIT"
     ok "buffer time has passed"
   else
@@ -316,6 +324,8 @@ verify() {
   check "IoT topic rules vehicle_*" "$(aws iot list-topic-rules --output text --query "rules[?starts_with(ruleName, 'vehicle_')].ruleName" 2>/dev/null | lines)"
   check "DynamoDB table" "$(aws dynamodb list-tables --output text --query "TableNames[?starts_with(@, 'vehicle-')]" 2>/dev/null | lines)"
   check "Lambda function" "$(aws lambda list-functions --output text --query "Functions[?starts_with(FunctionName, '$STACK')].FunctionName" 2>/dev/null | lines)"
+  check "Kinesis data stream" "$(aws kinesis list-streams --output text --query "StreamNames[?starts_with(@, '$STACK')]" 2>/dev/null | lines)"
+  check "SQS dead-letter queue" "$(aws sqs list-queues --queue-name-prefix "$STACK" --output text --query "QueueUrls[]" 2>/dev/null | grep -v '^None$' | lines)"
   check "Firehose delivery stream" "$(aws firehose list-delivery-streams --limit 10000 --output text --query "DeliveryStreamNames[?starts_with(@, '$STACK')]" 2>/dev/null | lines)"
   check "SNS topics" "$(aws sns list-topics --output text --query "Topics[?contains(TopicArn, ':$STACK-')].TopicArn" 2>/dev/null | lines)"
   check "CloudWatch alarms" "$(aws cloudwatch describe-alarms --alarm-name-prefix "$STACK" --output text --query "MetricAlarms[].AlarmName" 2>/dev/null | lines)"

@@ -1,4 +1,4 @@
-"""Checks added in v4.1: identity in every IoT rule comes from the MQTT topic, monitoring and data protection
+"""Checks added in v4.1 and v5.0: identity in every IoT rule comes from the MQTT topic, monitoring and data protection
 are wired as documented, and the device script prints a clear verdict for the spoof (security) test."""
 import pathlib, sys
 
@@ -16,30 +16,53 @@ def rule_sql(name):
     return " ".join(R[name]["Properties"]["TopicRulePayload"]["Sql"].split())
 
 
-def test_latest_state_rule_takes_vehicle_id_from_topic_not_payload():
-    sql = rule_sql("LatestStateRule")
-    assert "topic(2) AS vehicle_id" in sql
-    assert "SELECT *" not in sql          # a payload field could otherwise override the key
+def test_single_rule_takes_vehicle_id_from_topic_and_partitions_by_it():
+    sql = rule_sql("TelemetryRule")
+    assert "topic(2) AS topic_vehicle_id" in sql
+    act = R["TelemetryRule"]["Properties"]["TopicRulePayload"]["Actions"]
+    assert len(act) == 1 and act[0]["Kinesis"]["PartitionKey"] == "${topic(2)}"
 
 
-def test_low_tyre_alert_takes_vehicle_id_from_topic():
-    assert rule_sql("LowTyreRule").startswith("SELECT topic(2) AS vehicle_id")
+def test_only_one_iot_rule_v5():
+    # v5.0: one rule writes to the Kinesis stream; latest state and alerts are consumers of the stream
+    rules = [n for n, r in R.items() if r["Type"] == "AWS::IoT::TopicRule"]
+    assert rules == ["TelemetryRule"]
 
 
-def test_history_rule_passes_topic_id_to_the_validation_lambda():
-    assert "topic(2) AS topic_vehicle_id" in rule_sql("TelemetryRule")
+def test_firehose_reads_the_stream_and_writes_parquet():
+    p = R["DeliveryStream"]["Properties"]
+    assert p["DeliveryStreamType"] == "KinesisStreamAsSource"
+    d = p["ExtendedS3DestinationConfiguration"]
+    assert d["DataFormatConversionConfiguration"]["Enabled"] is True
+    assert "ParquetSerDe" in d["DataFormatConversionConfiguration"]["OutputFormatConfiguration"]["Serializer"]
+    assert d["BufferingHints"]["SizeInMBs"] >= 64          # Parquet conversion requires >= 64 MB
+    assert d["S3BackupConfiguration"]["CompressionFormat"] == "GZIP"
+    sd = R["TelemetryTable"]["Properties"]["TableInput"]["StorageDescriptor"]
+    assert "parquet" in sd["SerdeInfo"]["SerializationLibrary"].lower()
 
 
-def test_latest_state_rule_keeps_every_sensor_field():
-    sql = rule_sql("LatestStateRule")
-    for f in ("event_time", "tyre_fl_psi", "tyre_fr_psi", "tyre_rl_psi", "tyre_rr_psi", "accelerator_pct",
-              "clutch_pct", "speed_kmph", "fuel_level_pct", "fuel_efficiency_kmpl", "ingest_ts"):
-        assert f in sql, f
+def test_state_consumer_has_retries_bisect_and_dead_letter_queue():
+    p = R["StateEventSource"]["Properties"]
+    assert p["BisectBatchOnFunctionError"] is True
+    assert p["FunctionResponseTypes"] == ["ReportBatchItemFailures"]
+    assert p["DestinationConfig"]["OnFailure"]["Destination"] == ["StateDLQ", "Arn"] or "StateDLQ" in str(p["DestinationConfig"])
+    assert p["MaximumRetryAttempts"] >= 1
+
+
+def test_inline_lambdas_fit_the_inline_code_limit():
+    for fn in ("TransformFunction", "StateFunction"):
+        assert len(R[fn]["Properties"]["Code"]["ZipFile"]) < 4096, fn
+
+
+def test_stream_is_encrypted_and_kept_24h():
+    p = R["TelemetryStream"]["Properties"]
+    assert p["StreamEncryption"]["EncryptionType"] == "KMS"
+    assert p["RetentionPeriodHours"] >= 24
 
 
 def test_all_alarms_notify_the_operations_topic():
     alarms = [r for r in R.values() if r["Type"] == "AWS::CloudWatch::Alarm"]
-    assert len(alarms) == 6
+    assert len(alarms) == 10
     for a in alarms:
         assert a["Properties"]["AlarmActions"] == ["OpsTopic"]
 

@@ -2,7 +2,9 @@
 
 Sensor data from connected cars flows into AWS, gets validated, and lands in queryable tables. The project adds low-tyre alerts, a real-time "latest state" view per car, operations monitoring, per-device security and a small AI chatbot that answers questions about the fleet.
 
-> **Status:** proof of concept with production-minded foundations. The sensors are **simulated** (`simulator.py`), and a real-device-style publisher (`device_mqtt.py`) uses X.509 certificates over MQTT. Everything on the AWS side is real and is created from one CloudFormation template. All data is synthetic.
+> **Status (v5.0, production upgrade):** the pipeline now runs on a production-style architecture: one IoT rule writes to an encrypted **Kinesis Data Stream**; Firehose reads the stream and lands **Parquet**; a **state Lambda** reads the same stream in batches and keeps the latest state per car (newest reading wins) and sends **de-duplicated** alerts; failures retry, then land in a **dead-letter queue**; 10 alarms watch it. A load test (`load_test.py`) measures throughput and end-to-end latency. See [docs/PERFORMANCE_SCALABILITY.md](docs/PERFORMANCE_SCALABILITY.md) for the current-vs-production analysis.
+>
+> Earlier status (v4.1): proof of concept with production-minded foundations. The sensors are **simulated** (`simulator.py`), and a real-device-style publisher (`device_mqtt.py`) uses X.509 certificates over MQTT. Everything on the AWS side is real and is created from one CloudFormation template. All data is synthetic.
 
 ### Architecture
 
@@ -31,48 +33,51 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 
 | Requirement | How it is covered |
 |---|---|
-| Sensor -> AWS service -> table | device -> AWS IoT Core -> Amazon Data Firehose (+ validation Lambda) -> Amazon S3 -> AWS Glue table -> Amazon Athena |
+| Sensor -> AWS service -> table | device -> AWS IoT Core -> Amazon Kinesis Data Streams -> Amazon Data Firehose (+ validation Lambda, Parquet) -> Amazon S3 -> AWS Glue table -> Amazon Athena |
 | Tyre pressure | 4 tyres in psi; e-mail alert below 28 psi (parameter `LowTyrePsi`) |
 | Accelerator and clutch | pedal positions in percent; harsh-acceleration and clutch-usage reports |
 | Fuel efficiency | km/l and fuel level; per-car averages |
 | Report to driver / support team | SNS alert e-mail, DynamoDB latest state per car, SQL reports, chatbot |
 | AI chatbot | `chatbot.py`: 7 fixed read-only Athena queries; an LLM (any OpenAI-compatible API such as Google Gemini, or Amazon Bedrock, or OpenAI) picks the query and phrases the answer; keyword fallback without an LLM |
 | Different or bad data from real devices | validation Lambda: typed and range-checked fields, unknown fields kept in `extras`, problems flagged in `dq_issues`, original message kept in `raw/` |
-| Operations | CloudWatch dashboard, 5 alarms (6 with the optional no-data alarm) sent to a separate operations SNS topic, log groups with 30-day retention |
+| Operations | CloudWatch dashboard, 9 alarms (10 with the optional no-data alarm) sent to a separate operations SNS topic, custom metrics from the state Lambda, log groups with 30-day retention, dead-letter queue |
 | Security | per-device IoT policy, identity taken from the MQTT topic, TLS-only encrypted private bucket, DynamoDB point-in-time recovery, no secrets in code |
 
 ## 2. How it works
 
 1. **Device** publishes one JSON reading every 2 seconds to `vehicles/<vehicle_id>/telemetry` (MQTT, QoS 1). `simulator.py` uses AWS credentials; `device_mqtt.py` uses a per-vehicle X.509 certificate like real telematics hardware.
-2. **AWS IoT Core** checks the device policy (a car may publish only to its own topic) and runs three topic rules. Every rule takes the vehicle id from the topic with `topic(2)`, never from the payload.
-3. **Rule 1, history:** sends every reading to **Amazon Data Firehose**, which buffers for 60 seconds or 1 MB. On the way, the **validation Lambda** checks and normalises each record. Clean records go to `telemetry/dt=YYYY-MM-DD/hr=HH/`, untouched originals to `raw/dt=YYYY-MM-DD/`, and records that cannot be processed to `errors/`.
-4. **AWS Glue Data Catalog** defines the table `telemetry` with partition projection (no crawler), and **Amazon Athena** queries it in the workgroup `vehicle-telemetry` (1 GB scan limit per query).
-5. **Rule 2, alert:** if any tyre is below 28 psi, it publishes the reading to an **SNS** topic that e-mails the driver/support subscriber.
-6. **Rule 3, latest state:** overwrites one item per car in **DynamoDB** table `vehicle-latest-state`, so the newest reading is available in about a second.
-7. **CloudWatch** shows a dashboard and sends alarms to a separate operations SNS topic.
-8. **Chatbot** maps a question to one of 7 fixed queries, runs it on Athena and, if an LLM is configured, asks the LLM to phrase the small result.
+2. **AWS IoT Core** checks the device policy (a car may publish only to its own topic) and runs **one** topic rule, `vehicle_telemetry_ingest`. It adds `topic_vehicle_id` (from `topic(2)`, never from the payload) and `ingest_ts`, and writes the reading to the **Kinesis Data Stream** `vehicle-telemetry-stream`, using the vehicle id as the partition key (all readings of one car stay in order).
+3. **Kinesis Data Stream** keeps every reading for 24 hours (replay), absorbs bursts, and feeds two independent consumers. Mode `PROVISIONED` with 1 shard (1,000 records/s) for the demo, `ON_DEMAND` for production (parameter `StreamMode`).
+4. **History path:** **Amazon Data Firehose** reads the stream; the **validation Lambda** checks and normalises each record; Firehose converts it to **Parquet** (Snappy) and writes `telemetry/dt=YYYY-MM-DD/hr=HH/`. Untouched originals go GZIP-compressed to `raw/dt=YYYY-MM-DD/`, records that cannot be processed to `errors/`. Buffer: 64 MB or `BufferIntervalSeconds` (60 s demo, 300 to 900 s production).
+5. **AWS Glue Data Catalog** defines the Parquet table `telemetry` with partition projection (no crawler), and **Amazon Athena** queries it in the workgroup `vehicle-telemetry` (1 GB scan limit per query).
+6. **Real-time path:** the **state Lambda** `vehicle-telemetry-state` reads the stream in batches of up to 100. It updates one item per car in **DynamoDB** `vehicle-latest-state` only if the reading is newer than the stored one (a late or replayed reading never overwrites newer data). If a tyre is below 28 psi it sends **one** SNS e-mail per car per `AlertCooldownSeconds` (15 minutes) instead of one per message.
+7. **Failures:** a failing record is retried (batch split in half, up to 3 retries); what still fails is recorded in the SQS **dead-letter queue** `vehicle-telemetry-state-dlq` and raises an alarm.
+8. **CloudWatch** shows a dashboard (stream, lag, Firehose, Lambdas, alerts) and sends 9 alarms to a separate operations SNS topic.
+9. **Chatbot** maps a question to one of 7 fixed queries, runs it on Athena and, if an LLM is configured, asks the LLM to phrase the small result.
 
-The history path (S3/Athena) is **near-real-time** (about 1 to 2 minutes, because Firehose batches). The latest-state path (DynamoDB) is **real-time** (about a second).
+The history path (S3/Athena) is **near-real-time** (about 2 minutes with the demo buffer). The latest-state path (DynamoDB) is **real-time** (about 1 to 2 seconds; measure it with `load_test.py`).
 
 ## 3. Repository layout
 
 ```
 .
 ├── README.md                     this file: design, playbook, troubleshooting
-├── template.yaml                 CloudFormation: every AWS resource (30), incl. the validation Lambda code
+├── template.yaml                 CloudFormation: every AWS resource (38), incl. the validation and state Lambda code
 ├── simulator.py                  simulated cars (AWS credentials over HTTPS)
 ├── device_mqtt.py                real-device-style publisher (X.509 certificate, MQTT, store-and-forward outbox)
 ├── send_test_events.py           7 schema-drift / bad-data test events for vehicle CAR-900
 ├── chatbot.py                    question -> 1 of 7 fixed read-only queries -> optional LLM sentence
+├── load_test.py                  N vehicles x 1 msg/s through IoT Core; throughput and end-to-end latency (v5.0)
 ├── sql/queries.sql               report queries for the Athena console
 ├── scripts/
 │   ├── provision_device.sh       create an IoT thing + certificate and attach the device policy (safe to re-run)
 │   ├── deprovision_device.sh     remove one device and EVERY certificate attached to it (asks AWS)
 │   └── teardown.sh               delete the whole project, fix what blocks the delete, prove nothing is left
-├── tests/                        79 unit tests (no AWS account needed)
+├── tests/                        93 unit tests (no AWS account needed)
 ├── screenshots/                  architecture diagram and redacted evidence from real runs (section 13)
 ├── docs/
-│   └── PRODUCTION_READINESS.md   gap analysis and roadmap from proof of concept to production
+│   ├── PRODUCTION_READINESS.md   gap analysis and roadmap from proof of concept to production
+│   └── PERFORMANCE_SCALABILITY.md  current (v4.1) vs production (v5.0) architecture: limits, numbers, improvements
 ├── requirements.txt
 └── .github/workflows/ci.yml      runs the tests, cfn-lint and a shell syntax check on every push
 ```
@@ -119,11 +124,15 @@ Table `vehicle_telemetry.telemetry` (JSON in S3):
 
 A brand-new sensor does **not** become a column automatically. Automatic schema detection (for example a Glue crawler) lets one faulty device create wrong columns or change a type and break reports. A person promotes a field from `extras` to a column by updating the Lambda field list, the Glue columns and the tests.
 
-**Identity comes from the topic.** The device policy binds a certificate to its own topic, so the topic is the trusted identity. All three IoT rules and the Lambda use the topic id; the payload id is only compared and flagged.
+**Identity comes from the topic.** The device policy binds a certificate to its own topic, so the topic is the trusted identity. The IoT rule and both Lambdas use the topic id; the payload id is only compared and flagged.
 
 **CloudFormation** needs nothing installed in AWS CloudShell. The resources map one to one to Terraform if a team standard requires it.
 
-**Firehose instead of Kinesis Data Streams** keeps the moving parts to a minimum for landing data in S3. High volume, several consumers or replay would call for Kinesis Data Streams or Amazon MSK.
+**Kinesis Data Streams in front of everything (v5.0).** Up to v4.1 three IoT rules wrote directly to Firehose, SNS and DynamoDB: no replay, no ordering, one alert e-mail per message and a late reading could overwrite newer state. A stream gives one durable, ordered, replayable buffer and lets each consumer scale and fail on its own. Amazon MSK would be the choice for a Kafka-based organisation; it costs more to run.
+
+**Parquet instead of JSON (v5.0).** Athena reads only the columns a query needs from compressed Parquet, so a typical fleet query scans several times less data than with JSON text (cost and speed both follow the bytes scanned).
+
+**Newest reading wins (v5.0).** QoS 1 and the device outbox can deliver a reading twice or late. The state Lambda writes with the condition `event_time <= new event_time`, so replays are harmless (idempotent) and never move the state backwards.
 
 **Chatbot safety.** The LLM never writes SQL. It returns JSON naming one of 7 intents (`latest_status`, `lowest_tyre`, `fuel_efficiency`, `harsh_acceleration`, `clutch_usage`, `data_quality`, `vehicle_summary`) and optionally a vehicle id that must match `^CAR-\d{3}$`. Every query is a read-only `SELECT` limited to the last 2 days of partitions. If the LLM fails, keyword routing takes over and the table is printed.
 
@@ -132,8 +141,8 @@ A brand-new sensor does **not** become a column automatically. Automatic schema 
 | Layer | In place | Not done yet |
 |---|---|---|
 | Device identity | one certificate and thing per vehicle; `vehicle-device-policy` allows connect as its own thing name, publish only to its own telemetry topic, subscribe/receive only its own commands topic | fleet provisioning, certificate rotation, AWS IoT Device Defender |
-| Service access | least-privilege IAM roles for Firehose, IoT rules and the Lambda, scoped to this stack's resources | IAM Access Analyzer review |
-| Data | bucket blocks public access, AES-256 encryption, policy denies non-TLS requests; lifecycle expiry; DynamoDB point-in-time recovery | customer-managed KMS keys, versioning |
+| Service access | least-privilege IAM roles for Firehose, the IoT rule and both Lambdas, scoped to this stack's resources | IAM Access Analyzer review |
+| Data | bucket blocks public access, AES-256 encryption, versioning, policy denies non-TLS requests; lifecycle expiry and IA tiering; Kinesis stream KMS-encrypted; SQS queue encrypted; DynamoDB encryption and point-in-time recovery | customer-managed KMS keys |
 | Detection | IoT rule error log, alarms | CloudTrail, GuardDuty, Security Hub |
 | Secrets | none in code; `certs/`, `*.pem`, `*.key`, `.env` ignored by git; LLM key only in an environment variable | AWS Secrets Manager |
 | Privacy | synthetic data only | consent, minimisation and retention for real location and driving data |
@@ -142,25 +151,29 @@ The free tier of an external LLM API may use prompts to improve the provider's p
 
 ## 7. Observability
 
-* **Dashboard** `vehicle-telemetry`: messages from vehicles, IoT rule success and failure, Firehose records and delivery, data freshness, validation Lambda invocations and errors, alert e-mails, alarm status.
+* **Dashboard** `vehicle-telemetry`: messages from vehicles and rule success/failure, Kinesis records in and throttles, latest-state lag (iterator age), Firehose records and freshness, state Lambda counters (updated, stale, alerts sent, alerts suppressed, failed), Lambda invocations and errors, alert e-mails, alarm status.
 * **Alarms** (to the operations SNS topic; in this demo it e-mails the same `AlertEmail` address as the driver/support alert, and in production it would go to the operations team):
 
 | Alarm | Fires when |
 |---|---|
-| vehicle-telemetry-iot-rule-failures | any IoT rule fails its action |
+| vehicle-telemetry-iot-rule-failures | the IoT rule cannot write to the stream |
+| vehicle-telemetry-stream-throttled | the stream throttled writes (add shards or use ON_DEMAND) |
 | vehicle-telemetry-firehose-delivery | Firehose cannot deliver to S3 |
-| vehicle-telemetry-data-freshness | oldest record in Firehose is older than 15 minutes |
+| vehicle-telemetry-data-freshness | oldest record in Firehose is older than 20 minutes |
 | vehicle-telemetry-transform-errors | the validation Lambda crashes |
+| vehicle-telemetry-state-errors | the state Lambda fails (it retries) |
+| vehicle-telemetry-state-lag | latest state is more than 60 s behind the stream for 3 minutes |
+| vehicle-telemetry-state-dlq | a reading failed every retry and is in the dead-letter queue |
 | vehicle-telemetry-alert-delivery-failed | SNS cannot deliver a driver/support alert |
 | vehicle-telemetry-no-data (optional) | no MQTT messages for 10 minutes; off by default (`EnableNoDataAlarm=true` to turn on) |
 
-* **Logs** (30 days): `/aws/lambda/vehicle-telemetry-transform`, `/vehicle-telemetry/firehose`, `/vehicle-telemetry/iot-rule-errors`.
+* **Logs** (30 days): `/aws/lambda/vehicle-telemetry-transform`, `/aws/lambda/vehicle-telemetry-state`, `/vehicle-telemetry/firehose`, `/vehicle-telemetry/iot-rule-errors`.
 
 ## 8. Tests and CI
 
 ```bash
 pip install -r requirements.txt
-python3 -m pytest -q          # 79 passed, no AWS account needed
+python3 -m pytest -q          # 93 passed, no AWS account needed
 cfn-lint template.yaml
 ```
 
@@ -170,7 +183,9 @@ cfn-lint template.yaml
 | tests/test_chatbot.py | read-only queries, partition filter, SQL parses (sqlglot), injection blocked, routing incl. `data_quality`, LLM client retries and fallback, key never in errors |
 | tests/test_transform.py | the validation Lambda taken from the template, rule error actions, Glue columns, bucket and device policy |
 | tests/test_device_and_events.py | device outbox and the CAR-900 test events |
-| tests/test_rules_and_device.py | every rule takes the id from the topic, alarms go to operations, PITR on, spoof-test verdict |
+| tests/test_rules_and_device.py | one rule, id from the topic and used as partition key; Firehose reads the stream and writes Parquet; retries, bisect and DLQ; inline code size; stream encryption; 10 alarms to operations; PITR; spoof-test verdict |
+| tests/test_state_processor.py | the state Lambda taken from the template, with fake DynamoDB/SNS: newest reading wins, late replays ignored, id from topic, one alert per cool-down and per car, bad records skipped, only the failed record retried, alert retried if SNS fails, metrics line |
+| tests/test_load_test.py | percentile and summary helpers of the load test |
 
 `.github/workflows/ci.yml` runs the tests and `cfn-lint` on every push and pull request.
 
@@ -189,7 +204,7 @@ export AWS_REGION=ap-south-1 AWS_DEFAULT_REGION=ap-south-1
 pip install -q -r requirements.txt awsiotsdk        # no --user flag: CloudShell uses a virtual environment
 python3 -m pytest -q
 ```
-**Expected:** `79 passed`. **If not:** fix the failing test before going on. If pip is slow because of cfn-lint, run `pip install -q pytest sqlglot boto3 pyyaml awsiotsdk` instead.
+**Expected:** `93 passed`. **If not:** fix the failing test before going on. If pip is slow because of cfn-lint, run `pip install -q pytest sqlglot boto3 pyyaml awsiotsdk` instead.
 
 ### 1. Deploy (new stack or update in place)
 ```bash
@@ -197,7 +212,7 @@ aws cloudformation deploy --template-file template.yaml --stack-name vehicle-tel
   --capabilities CAPABILITY_IAM --parameter-overrides AlertEmail=you@example.com --region ap-south-1
 ```
 Type your real e-mail address. A literal `<...>` placeholder breaks the shell.
-**Expected:** `Successfully created/updated stack - vehicle-telemetry` after 2 to 5 minutes. An update that fails rolls back on its own.
+**Expected:** `Successfully created/updated stack - vehicle-telemetry` after 3 to 6 minutes. An update that fails rolls back on its own.
 **If not:**
 ```bash
 aws cloudformation describe-stack-events --stack-name vehicle-telemetry --region ap-south-1 \
@@ -213,28 +228,30 @@ BUCKET=$(aws cloudformation describe-stacks --stack-name vehicle-telemetry --reg
 **Expected:** a name like `vehicle-telemetry-databucket-...`, not an empty value.
 
 📷 Console checks:
-* IoT Core -> Message routing -> Rules: 3 rules (`vehicle_telemetry_to_s3`, `vehicle_low_tyre_alert`, `vehicle_latest_state_to_dynamodb`), all Active.
-* Lambda -> Functions -> `vehicle-telemetry-transform`.
-* CloudWatch -> Dashboards -> `vehicle-telemetry`, and CloudWatch -> Alarms -> All alarms (5 alarms, or 6 with the no-data alarm on).
+* IoT Core -> Message routing -> Rules: 1 rule `vehicle_telemetry_ingest`, Active, action Kinesis.
+* Kinesis -> Data streams -> `vehicle-telemetry-stream`: Active, encryption on.
+* Lambda -> Functions -> `vehicle-telemetry-transform` and `vehicle-telemetry-state` (Configuration -> Triggers: Kinesis, Enabled).
+* SQS -> Queues -> `vehicle-telemetry-state-dlq`: 0 messages.
+* CloudWatch -> Dashboards -> `vehicle-telemetry`, and CloudWatch -> Alarms -> All alarms (9 alarms, or 10 with the no-data alarm on).
 * DynamoDB -> Tables -> `vehicle-latest-state`.
 
 ### 2. Data flow: sensor -> AWS -> table
 ```bash
 python3 simulator.py --vehicles 3 --count 30 --interval 2
 ```
-Wait 2 minutes (Firehose buffers 60 seconds), then 📷:
+Wait 3 minutes (the validation step and Firehose each buffer up to 60 seconds), then 📷:
 ```bash
 echo "${BUCKET:?run the BUCKET= line from step 1 first}"
 aws s3 ls s3://$BUCKET/telemetry/ --recursive | tail -3     # clean, validated data
 aws s3 ls s3://$BUCKET/raw/ --recursive | tail -3           # untouched originals
 ```
-**Expected:** keys under `telemetry/dt=.../hr=.../` and `raw/dt=.../`. If you see bucket names instead of keys, `$BUCKET` is empty.
+**Expected:** Parquet files under `telemetry/dt=.../hr=.../` and `.gz` files under `raw/dt=.../`. If you see bucket names instead of keys, `$BUCKET` is empty.
 In Athena (workgroup `vehicle-telemetry`, database `vehicle_telemetry`) 📷:
 ```sql
 SELECT vehicle_id, count(*) AS readings, min(schema_version) AS schema_version FROM telemetry GROUP BY vehicle_id ORDER BY 1;
 ```
 **Expected:** CAR-001 to CAR-003 with at least 30 readings each and schema_version `1`.
-**If 0 rows:** wait 2 more minutes, check the workgroup, and look for rejected records with `aws s3 ls s3://$BUCKET/errors/ --recursive`.
+**If 0 rows:** wait 2 more minutes, check the workgroup, and look for rejected records with `aws s3 ls s3://$BUCKET/errors/ --recursive` (a `format-conversion-failed/` folder means a record did not match the table columns).
 
 ### 3. Real-time latest state
 In tab 1, run `python3 simulator.py --vehicles 3 --count 0 --interval 2` (it runs until Ctrl+C). In tab 2 (CloudShell "+"), run this twice, 10 seconds apart 📷:
@@ -247,12 +264,13 @@ aws dynamodb scan --table-name vehicle-latest-state --query "Items[].[vehicle_id
 ```bash
 python3 simulator.py --vehicles 3 --count 40 --interval 2 --leak
 ```
-CAR-001's front-left tyre crosses 28 psi after roughly 15 to 28 batches. Press Ctrl+C after the first alert e-mail, because every reading below 28 psi sends one e-mail.
-**Expected:** e-mail "AWS Notification Message" with `"vehicle_id":"CAR-001"` and `tyre_fl_psi` below 28. 📷
+CAR-001's front-left tyre crosses 28 psi after roughly 15 to 28 batches. Let it run to the end: since v5.0 you get **one** e-mail per car per 15 minutes, not one per reading.
+**Expected:** e-mail with subject `Low tyre pressure: CAR-001` and a body like `{"vehicle_id": "CAR-001", ..., "low_tyres_psi": {"tyre_fl_psi": 27.8}, "threshold_psi": 28.0}`. 📷
+Proof of de-duplication: CloudWatch -> Dashboards -> `vehicle-telemetry` -> widget "State Lambda": `AlertsSent` 1, `AlertsSuppressed` > 0.
 ```sql
 SELECT event_time, tyre_fl_psi FROM telemetry WHERE vehicle_id='CAR-001' ORDER BY event_time DESC LIMIT 30;
 ```
-This proves the chain sensor -> IoT rule -> SNS -> e-mail. It does not prove delivery to a phone app, de-duplication or escalation (not built).
+This proves the chain sensor -> IoT rule -> stream -> state Lambda -> SNS -> e-mail with de-duplication. Delivery to a phone app and escalation are not built.
 
 ### 5. Schema drift and data validation
 ```bash
@@ -363,8 +381,17 @@ python3 chatbot.py --ask "Which car has the lowest tyre pressure and is it a pro
 Other providers: set `LLM_BASE_URL` for another OpenAI-compatible API, `OPENAI_API_KEY` and `OPENAI_MODEL` for OpenAI, or `BEDROCK_MODEL_ID` for Amazon Bedrock.
 **Safety test:** `python3 chatbot.py --no-llm --ask "CAR-001'; DROP TABLE telemetry --"` must answer normally. **Wrong-key test:** `export LLM_API_KEY=wrong`; the bot prints a warning and still answers with the table.
 
+### 8b. Load test and performance numbers (v5.0)
+```bash
+python3 load_test.py --vehicles 100 --seconds 60
+```
+Sends 6,000 readings (100 cars `LT-0001`... at 1 reading per second) and then measures how long the newest reading of 20 cars takes to reach DynamoDB.
+**Expected (about 2 minutes):** `messages sent : 6000 of 6000 ... -> about 100 msg/s`, `publish errors : 0`, an `end-to-end (publish -> DynamoDB)` line with p50 and p95 in milliseconds (typically 1 to 3 seconds), and `VERDICT : PASS`. 📷
+Then 📷 CloudWatch -> Dashboards -> `vehicle-telemetry`: the Kinesis widget shows about 6,000 records/minute with **0 throttled**, and the lag widget stays near 0. After 3 minutes in Athena: `SELECT count(*) FROM telemetry WHERE vehicle_id LIKE 'LT-%';` -> 6000.
+Larger runs: `--vehicles 500 --seconds 60` (about 500 msg/s, still under 1 shard's 1,000 records/s). Above that, redeploy with `StreamMode=ON_DEMAND` or `ShardCount=2` first, otherwise the `stream-throttled` alarm fires (this is the expected, visible limit).
+
 ### 9. Evidence checklist
-3 rules, Lambda, dashboard, alarm list, S3 `telemetry/` and `raw/`, row counts, DynamoDB changing, alert e-mail, 7-row drift result, CAR-777 count 0, `extras` query, raw original, operations alarm e-mails, S3 security outputs, PITR and device policy, device test positive and negative, chatbot keyword and LLM, `79 passed`, teardown verification.
+1 rule, Kinesis stream, 2 Lambdas, DLQ, dashboard, alarm list, S3 `telemetry/` and `raw/`, row counts, DynamoDB changing, alert e-mail, 7-row drift result, CAR-777 count 0, `extras` query, raw original, operations alarm e-mails, S3 security outputs, PITR and device policy, device test positive and negative, chatbot keyword and LLM, `93 passed`, load-test result and dashboard, teardown verification.
 
 ### 10. Tear down and verify nothing is left
 One script does the whole tear-down. It needs nothing from earlier sessions: no `$BUCKET`, no `certs/` folder. If CloudShell times out half-way, open it again and run the same two lines; every step first checks what still exists.
@@ -420,8 +447,8 @@ Then, outside AWS: delete the LLM API key in Google AI Studio, run `unset LLM_AP
 
 ## 11. Limitations and roadmap
 
-* Sensors are simulated; `device_mqtt.py` was tested from CloudShell, not on vehicle hardware, and nothing was load tested.
-* Alerts are e-mail only and not de-duplicated; no SMS, push or ticketing.
+* Sensors are simulated; `device_mqtt.py` was tested from CloudShell, not on vehicle hardware. `load_test.py` tests hundreds of vehicles from one CloudShell, not millions.
+* Alerts are e-mail only (de-duplicated per car since v5.0); no SMS, push or ticketing.
 * No per-vehicle offline alarm, SLOs or tracing.
 * CI only; no automatic deployment (CD) or separate dev/prod stacks.
 * No user interface beyond the Athena console and the command-line chatbot.
@@ -455,6 +482,8 @@ The architecture combines patterns that AWS and the IoT community publish for de
 | v3 | Bedrock blocked on the account; no paid OpenAI balance | OpenAI-compatible LLM client with a free Gemini key | 39 |
 | v4 | different data from real devices, real hardware, production grade, observability, security | validation Lambda and raw copy, dashboard and alarms, device policy and X.509 publisher, playbook | 70 |
 | v4.1 | issues found in the live v4 run | every rule takes the vehicle id from the topic; clearer test output; verified on AWS | 79 |
+| v4.1.1 | tear-down got stuck in a live run | `scripts/teardown.sh`: one re-runnable command that finds every certificate and the bucket itself and verifies the result | 79 |
+| v5.0 | "make it production level" | Kinesis Data Stream in front; Parquet; state Lambda with newest-wins writes and de-duplicated alerts; retries, bisect and DLQ; 10 alarms; versioned bucket; load test; performance and scalability analysis | 93 |
 
 ### References
 All links were opened and checked on 15 October 2026.

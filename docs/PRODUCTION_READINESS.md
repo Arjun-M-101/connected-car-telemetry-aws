@@ -1,21 +1,23 @@
 # From proof of concept to production: gap analysis and roadmap
 
+> **v5.0 update (19 Oct 2026):** the ingestion, real-time and alert items marked *v5.0* below are now built: Kinesis Data Stream in front, Parquet history, newest-wins latest state, de-duplicated alerts, retries with a dead-letter queue, 10 alarms and a load test. Analysis and numbers: [PERFORMANCE_SCALABILITY.md](PERFORMANCE_SCALABILITY.md).
+
 This project is a **working proof of concept with production-minded foundations**, not a finished production system.
 It proves the data path, alerting, validation, and the chatbot idea. This document lists exactly what is done, what is designed but not built, and what a real roll-out needs.
 
 ## 1. Status at a glance
 | Area | In the project now (v4) | Not yet (needed for production) |
 |---|---|---|
-| Ingestion | IoT Core MQTT, Firehose, S3 | Kinesis Data Streams or MSK for high volume and replay; batching/compression on device |
+| Ingestion | IoT Core MQTT -> **Kinesis Data Stream (v5.0)**, 24 h replay, per-vehicle ordering -> Firehose -> Parquet in S3 | MSK if the organisation standardises on Kafka; batching/compression on device; quota increases for >20k msg/s |
 | Schema / format change | Validation Lambda: typed known fields, unknown fields kept in `extras`, bad values flagged, raw copy kept, `schema_version` field | Schema registry and versioned contracts per device model; automated promotion of new fields into columns; Iceberg tables with schema evolution |
 | Real hardware | Device policy per vehicle, X.509 provisioning script, MQTT sender with store-and-forward outbox | Fleet provisioning at scale, OTA updates (IoT Jobs), tested on a real telematics unit / OBD-II dongle |
 | Infrastructure as code | CloudFormation (one template, validated by cfn-lint and 79 automated tests) | Environments (dev/test/prod), remote state not needed (CFN), or port to Terraform if the team standard requires it |
 | CI/CD | CI: pytest + cfn-lint on every push | CD: deploy via GitHub Actions with an AWS OIDC role, change sets reviewed, dev -> prod promotion |
 | Observability | Dashboard, 5 alarms plus an optional sixth, log groups with retention, IoT rule error logging, optional "fleet silent" alarm | Per-vehicle offline detection, SLOs and error budgets, tracing, on-call rota (PagerDuty/Opsgenie), runbooks per alarm |
 | Security | Least-privilege roles, per-device certificates and policy, TLS-only encrypted private bucket, topic-trusted identity, PITR on DynamoDB, secrets never in code | Customer-managed KMS keys, CloudTrail + GuardDuty + Security Hub + Config, VPC endpoints, IoT Device Defender, certificate rotation, data-privacy controls (location is personal data), pen test |
-| Alerts | Email via SNS for tyre pressure | De-duplication and hysteresis, escalation, SMS/push to driver app, ticket creation for support, per-customer preferences |
+| Alerts | Email via SNS for tyre pressure, **de-duplicated per car with a cool-down (v5.0)** | escalation, SMS/push to driver app, ticket creation for support, per-customer preferences |
 | User interface | CloudShell + Athena + chatbot CLI | QuickSight/Grafana dashboards, support-agent web app, driver mobile app, chatbot behind authenticated API |
-| Scale | 3 simulated cars | Load test (1 msg/s x N vehicles), cost model, partitioning and compaction strategy |
+| Scale | **load_test.py (v5.0)**: N cars x 1 msg/s, throughput and end-to-end latency; sizing in PERFORMANCE_SCALABILITY.md | multi-generator test at 10k+ cars, compaction / Iceberg |
 | Data governance | Raw/clean separation, lifecycle expiry | Catalog ownership, retention policy per regulation, lineage, access control per team (Lake Formation) |
 
 ## 2. Different fields or formats from real devices
@@ -72,7 +74,8 @@ It is a prototype by scope, on purpose: prove the path first, then harden. It do
 | 4 | Real hardware proof (Pi/ESP32/OBD-II), decoding of real payloads | 1 to 2 weeks |
 | 5 | UI: QuickSight dashboard on Athena; support web app; chatbot behind an authenticated API (API Gateway + Lambda + Cognito) | 1 to 2 weeks |
 | 6 | Alert engine: de-dup, hysteresis, escalation, SMS/push, ticketing | 1 week |
-| 7 | Scale and cost test; Kinesis/MSK if volume demands; Iceberg and compaction | 1 to 2 weeks |
+| 7 (v5.0, done) | Kinesis stream, Parquet, newest-wins state, alert de-duplication, DLQ, load test, scalability analysis | done |
+| 7b | Iceberg and compaction; 10k-car load test | 1 to 2 weeks |
 | 8 | Security review: KMS, CloudTrail, GuardDuty, Device Defender, pen test, privacy impact assessment | 1 to 2 weeks |
 
 **Terraform vs CloudFormation:** this project uses CloudFormation because it needs nothing installed in CloudShell. The lakehouse project uses Terraform; porting is mechanical (resources map one to one) and can be done if the team standard is Terraform.
