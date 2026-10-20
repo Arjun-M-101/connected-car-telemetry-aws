@@ -28,6 +28,7 @@ Sensor data from connected cars flows into AWS, gets validated, and lands in que
 11. [Limitations and roadmap](#11-limitations-and-roadmap)
 12. [Design basis, history and references](#12-design-basis-history-and-references)
 13. [Screenshots](#13-screenshots)
+14. [License and usage](#14-license-and-usage)
 
 ---
 
@@ -64,26 +65,27 @@ The history path (S3/Athena) is **near-real-time** (about 2 minutes with the dem
 
 ```
 .
-├── README.md                     this file: design, playbook, troubleshooting
-├── template.yaml                 CloudFormation: every AWS resource (45), incl. the code of the 3 Lambdas
-├── simulator.py                  simulated cars (AWS credentials over HTTPS)
-├── device_mqtt.py                real-device-style publisher (X.509 certificate, MQTT, store-and-forward outbox)
-├── send_test_events.py           7 schema-drift / bad-data test events for vehicle CAR-900
-├── chatbot.py                    question -> 1 of 7 fixed read-only queries -> optional LLM sentence
-├── load_test.py                  N vehicles x 1 msg/s through IoT Core; throughput and end-to-end latency (v5.0)
-├── resilience_test.py            late, duplicate, future-clock, impossible-value and hysteresis checks on the live stack (v5.0)
-├── sql/queries.sql               report queries for the Athena console
+├── README.md                       this file: design, playbook, troubleshooting
+├── template.yaml                   CloudFormation: every AWS resource (45), incl. the code of the 3 Lambdas
+├── simulator.py                    simulated cars (AWS credentials over HTTPS)
+├── device_mqtt.py                  real-device-style publisher (X.509 certificate, MQTT, store-and-forward outbox)
+├── send_test_events.py             7 schema-drift / bad-data test events for vehicle CAR-900
+├── chatbot.py                      question -> 1 of 7 fixed read-only queries -> optional LLM sentence
+├── load_test.py                    N vehicles x 1 msg/s through IoT Core; throughput and end-to-end latency (v5.0)
+├── resilience_test.py              late, duplicate, future-clock, impossible-value and hysteresis checks on the live stack (v5.0)
+├── sql/queries.sql                 report queries for the Athena console
 ├── scripts/
-│   ├── provision_device.sh       create an IoT thing + certificate and attach the device policy (safe to re-run)
-│   ├── deprovision_device.sh     remove one device and EVERY certificate attached to it (asks AWS)
-│   └── teardown.sh               delete the whole project, fix what blocks the delete, prove nothing is left
-├── tests/                        109 unit tests (no AWS account needed)
-├── screenshots/                  architecture diagram and redacted evidence from real runs (section 13)
+│   ├── provision_device.sh         create an IoT thing + certificate and attach the device policy (safe to re-run)
+│   ├── deprovision_device.sh       remove one device and EVERY certificate attached to it (asks AWS)
+│   └── teardown.sh                 delete the whole project, fix what blocks the delete, prove nothing is left
+├── tests/                          109 unit tests (no AWS account needed)
+├── screenshots/                    architecture diagram and redacted evidence from real runs (section 13)
 ├── docs/
-│   ├── PRODUCTION_READINESS.md   gap analysis and roadmap from proof of concept to production
+│   ├── PRODUCTION_READINESS.md     gap analysis and roadmap from proof of concept to production
 │   └── PERFORMANCE_SCALABILITY.md  current (v4.1) vs production (v5.0) architecture: limits, numbers, improvements
 ├── requirements.txt
-└── .github/workflows/ci.yml      runs the tests, cfn-lint and a shell syntax check on every push
+├── .github/workflows/ci.yml        runs the tests, cfn-lint and a shell syntax check on every push
+└── LICENSE                         # All rights reserved (view and evaluate only)
 ```
 
 ## 4. Message and table schema
@@ -828,3 +830,10 @@ Keyword mode, the data-quality question, and LLM mode (sentence matches the tabl
 
 ![Chatbot LLM mode: sentence matches the table](screenshots/chatbot-v4-llm-lowest-tyre.png)
 
+## 14. License and usage
+
+© 2026 Arjun M. All rights reserved.
+
+This repository is published so recruiters, hiring managers and engineers can read and evaluate my work. You may view the code, and clone and run it privately to evaluate it. You may not copy, modify, redistribute or reuse it, in whole or in part, in any other project, product, service or training dataset without my written permission. See [LICENSE](LICENSE). Third-party datasets, libraries and icons keep their own licenses.
+
+Permission requests: arjunmpec101@gmail.com
