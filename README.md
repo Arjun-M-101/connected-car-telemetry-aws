@@ -2,6 +2,8 @@
 
 Sensor data from connected cars flows into AWS, gets validated, and lands in queryable tables. The project adds low-tyre alerts, a real-time "latest state" view per car, operations monitoring, per-device security and a small AI chatbot that answers questions about the fleet.
 
+> **License:** © 2026 Arjun M. All rights reserved. Published for viewing and evaluation only, see [LICENSE](LICENSE).
+
 > **Status (v5.0, production upgrade):** the pipeline now runs on a production-style architecture: one IoT rule writes to an encrypted **Kinesis Data Stream**; Firehose reads the stream and lands **Parquet**; a **state Lambda** reads the same stream in batches and keeps the latest state per car (newest **valid** reading wins: late, duplicate, future-clock and impossible readings cannot corrupt it) and sends alerts with a cool-down, reminders and **hysteresis**; a scheduled check reports **offline** vehicles; failures retry, then land in a **dead-letter queue**; 11 alarms watch it (12 with the optional no-data alarm). `load_test.py` measures throughput and latency, `resilience_test.py` proves the real-world cases on the live stack. See [docs/PERFORMANCE_SCALABILITY.md](docs/PERFORMANCE_SCALABILITY.md) for the current-vs-production analysis.
 >
 > Earlier status (v4.1): proof of concept with production-minded foundations. The sensors are **simulated** (`simulator.py`), and a real-device-style publisher (`device_mqtt.py`) uses X.509 certificates over MQTT. Everything on the AWS side is real and is created from one CloudFormation template. All data is synthetic.
